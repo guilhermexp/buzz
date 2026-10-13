@@ -318,3 +318,72 @@ async fn removed_member_loses_live_huddle_audio_and_cannot_rejoin() {
     let _ = remaining_ws.send(Message::Close(None)).await;
     owner_client.disconnect().await.expect("disconnect owner");
 }
+
+/// Latest NIP-29 member list (39002) the relay published for `channel`.
+async fn listed_members(client: &mut BuzzTestClient, channel: &str) -> Vec<String> {
+    let sub = format!("huddle-members-{}", Uuid::new_v4());
+    client
+        .subscribe(
+            &sub,
+            vec![Filter::new()
+                .kind(Kind::Custom(39002))
+                .custom_tags(SingleLetterTag::lowercase(Alphabet::D), [channel])],
+        )
+        .await
+        .expect("subscribe 39002");
+    let events = client
+        .collect_until_eose(&sub, Duration::from_secs(5))
+        .await
+        .expect("collect 39002");
+    client.close_subscription(&sub).await.expect("close sub");
+    events
+        .iter()
+        .max_by_key(|event| event.created_at)
+        .map(|event| {
+            event
+                .tags
+                .iter()
+                .filter_map(|tag| match tag.as_slice() {
+                    [name, pubkey, ..] if name == "p" => Some(pubkey.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+#[ignore]
+async fn auto_added_huddle_joiner_is_published_in_member_list() {
+    let owner = Keys::generate();
+    let joiner = Keys::generate();
+    let other = Keys::generate();
+    let joiner_hex = joiner.public_key().to_hex();
+    let (mut owner_client, parent, huddle) = start_huddle(&owner, [&joiner, &other]).await;
+    assert!(
+        !listed_members(&mut owner_client, &huddle)
+            .await
+            .contains(&joiner_hex),
+        "joiner is not a huddle member before joining"
+    );
+
+    // Joining through parent-derived auto-add writes a huddle membership; the
+    // relay must republish 39002 so clients counting the huddle's humans see it.
+    let (mut joiner_ws, joined) = open_audio(&joiner, &huddle, &parent).await;
+    assert_eq!(joined["type"], "joined", "joiner joins: {joined}");
+    let mut listed = Vec::new();
+    for _ in 0..20 {
+        listed = listed_members(&mut owner_client, &huddle).await;
+        if listed.contains(&joiner_hex) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        listed.contains(&joiner_hex),
+        "39002 lists the auto-added joiner: {listed:?}"
+    );
+
+    let _ = joiner_ws.send(Message::Close(None)).await;
+    owner_client.disconnect().await.expect("disconnect owner");
+}

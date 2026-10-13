@@ -6,6 +6,7 @@
 - feat(cli): `buzz workflows approve --token` accepts the published 64-hex approval reference.
 - feat(relay): Web Push transport — the relay delivers push leases with a `webpush` endpoint itself (RFC 8291 aes128gcm payload encryption, RFC 8292 VAPID), behind an https host allow-list; NIP-11 advertises `push.webpush.application_server_key` and only configured transports (NIP-PL "Web Push" profile).
 - fix(relay): removing a member from a channel (kind 9001, self-leave 9022, admin kick) now ends their live huddle audio — sockets in the channel's linked huddle rooms get a terminal `membership_revoked` frame and close (normal `left` + 48102), derived huddle memberships are revoked and rejoin is refused.
+- fix(relay): a huddle joiner admitted through parent-derived auto-add is now republished in the huddle's NIP-29 member list (39002), so clients counting the remaining humans when someone leaves no longer end a huddle that still has participants.
 
 ## v0.5.28
 

@@ -1507,6 +1507,26 @@ pub(crate) async fn handle_active_audio_connection(
             // Bootstrap prepared inside the permit; assigned here for ordered
             // write to `ctrl_tx` after it is created below, before task spawns.
             bootstrap_joined_msg = msg;
+            // An auto-admitted joiner is a new channel member: republish the
+            // NIP-29 member list (39002) like every other membership write, so
+            // clients counting the huddle's humans see the joiner. Spawned so
+            // discovery never delays the `joined` bootstrap.
+            if matches!(
+                membership_admission,
+                MembershipAdmission::AutoAddRequired { .. }
+            ) {
+                let state = Arc::clone(&state);
+                let tenant = tenant.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::handlers::side_effects::emit_group_discovery_events(
+                        &tenant, &state, channel_id,
+                    )
+                    .await
+                    {
+                        warn!(channel = %channel_id, error = %e, "NIP-29 group discovery emission after audio auto-add failed");
+                    }
+                });
+            }
             //
             // Fix B (remote path): now that the ingress DB transaction has
             // committed, tell the owner that this peer's slot is committed so
