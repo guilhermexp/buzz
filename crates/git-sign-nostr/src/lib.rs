@@ -84,7 +84,7 @@ use chrono::DateTime;
 use nostr::hashes::sha256::Hash as Sha256Hash;
 use nostr::hashes::{Hash, HashEngine};
 use nostr::secp256k1::schnorr::Signature;
-use nostr::secp256k1::{Keypair, Message};
+use nostr::secp256k1::{Keypair, Message, XOnlyPublicKey};
 use nostr::{FromBech32, PublicKey, SecretKey, SECP256K1};
 use zeroize::Zeroize;
 
@@ -1017,7 +1017,7 @@ fn do_sign(key_id: &str, status: &mut StatusWriter) -> Result<(), Error> {
     let oa = load_auth_tag()?;
     if let Some(ref oa_val) = oa {
         // Owner pubkey must be a valid BIP-340 key
-        if PublicKey::from_hex(&oa_val.0).is_err() {
+        if parse_bip340_pubkey(&oa_val.0).is_err() {
             return Err(Error::Fatal(
                 "auth tag owner (oa[0]) is not a valid BIP-340 public key".to_string(),
             ));
@@ -1188,7 +1188,7 @@ fn do_verify(sig_file: &str, status: &mut StatusWriter) -> Result<(), Error> {
     }
 
     // Validate pk is a valid BIP-340 x-only public key
-    let pk = PublicKey::from_hex(&envelope.pk).map_err(|e| {
+    let pk = parse_bip340_pubkey(&envelope.pk).map_err(|e| {
         write_errsig(status, Some(&envelope.pk));
         Error::VerifyFailed {
             pk: Some(envelope.pk.clone()),
@@ -1223,14 +1223,7 @@ fn do_verify(sig_file: &str, status: &mut StatusWriter) -> Result<(), Error> {
     })?;
 
     // Verify BIP-340 signature
-    let xonly = pk.xonly().map_err(|_| {
-        write_errsig(status, Some(&envelope.pk));
-        Error::VerifyFailed {
-            pk: Some(envelope.pk.clone()),
-            msg: "invalid public key xonly conversion".to_string(),
-        }
-    })?;
-    if SECP256K1.verify_schnorr(&sig, &message, &xonly).is_err() {
+    if SECP256K1.verify_schnorr(&sig, &message, &pk).is_err() {
         status.write_line("NEWSIG");
         status.write_line(&format!("BADSIG {} {}", envelope.pk, envelope.pk));
         return Err(Error::VerifyFailed {
@@ -1243,7 +1236,7 @@ fn do_verify(sig_file: &str, status: &mut StatusWriter) -> Result<(), Error> {
     let oa_result = if let Some(ref oa) = envelope.oa {
         // Validate oa[0] is a valid BIP-340 public key. Per NIP-GS spec,
         // an invalid owner pubkey is a structural error → ERRSIG.
-        if PublicKey::from_hex(&oa.0).is_err() {
+        if parse_bip340_pubkey(&oa.0).is_err() {
             write_errsig(status, Some(&envelope.pk));
             return Err(Error::VerifyFailed {
                 pk: Some(envelope.pk),
@@ -1420,7 +1413,7 @@ fn parse_envelope(json_str: &str) -> Result<Envelope, String> {
         }
 
         // Validate oa[0] is a valid BIP-340 x-only public key (not just hex)
-        PublicKey::from_hex(owner)
+        parse_bip340_pubkey(owner)
             .map_err(|e| format!("oa[0] is not a valid BIP-340 public key: {e}"))?;
 
         // Self-attestation is meaningless — owner must differ from signer
@@ -1459,6 +1452,15 @@ fn validate_hex_field(val: &str, expected_len: usize, name: &str) -> Result<(), 
         return Err(format!("{name} must be lowercase hex"));
     }
     Ok(())
+}
+
+/// Parse a lowercase-hex x-only key and require it to be a valid BIP-340 point.
+///
+/// `nostr::PublicKey::from_hex` only decodes 32 bytes and does not check that
+/// they lie on the curve, so every key taken from an envelope or auth tag must
+/// go through this parse before it is treated as a public key.
+fn parse_bip340_pubkey(hex: &str) -> Result<XOnlyPublicKey, nostr::key::Error> {
+    PublicKey::from_hex(hex)?.xonly()
 }
 
 fn parse_armor(content: &str) -> Result<&str, String> {
@@ -1501,7 +1503,7 @@ fn verify_oa(agent_pk_hex: &str, oa: &(String, String, String)) -> bool {
     let (owner_pk_hex, conditions, owner_sig_hex) = oa;
 
     // Parse owner pubkey
-    let owner_pk = match PublicKey::from_hex(owner_pk_hex) {
+    let owner_pk = match parse_bip340_pubkey(owner_pk_hex) {
         Ok(p) => p,
         Err(_) => {
             eprintln!("warning: oa owner pubkey is not a valid BIP-340 key");
@@ -1530,14 +1532,7 @@ fn verify_oa(agent_pk_hex: &str, oa: &(String, String, String)) -> bool {
         }
     };
 
-    let xonly = match owner_pk.xonly() {
-        Ok(x) => x,
-        Err(_) => {
-            eprintln!("warning: oa owner pubkey conversion to xonly failed");
-            return false;
-        }
-    };
-    if SECP256K1.verify_schnorr(&sig, &message, &xonly).is_err() {
+    if SECP256K1.verify_schnorr(&sig, &message, &owner_pk).is_err() {
         eprintln!("warning: NIP-OA owner attestation signature verification failed");
         return false;
     }

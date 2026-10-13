@@ -8,6 +8,9 @@
 - fix(relay): removing a member from a channel (kind 9001, self-leave 9022, admin kick) now ends their live huddle audio — sockets in the channel's linked huddle rooms get a terminal `membership_revoked` frame and close (normal `left` + 48102), derived huddle memberships are revoked and rejoin is refused.
 - fix(relay): a huddle joiner admitted through parent-derived auto-add is now republished in the huddle's NIP-29 member list (39002), so clients counting the remaining humans when someone leaves no longer end a huddle that still has participants.
 - feat(media): `PUT /upload` accepts WAV voice notes — canonical 16-bit PCM RIFF/WAVE only (1–2 channels, 8–48 kHz, ≤ 5 min); metadata chunks (LIST/INFO, id3, bext…), non-PCM, malformed sizes and trailing bytes are refused (422) rather than rewritten, so stored bytes keep the client's Blossom hash. Served as an `audio/wav` attachment with `nosniff`; the descriptor and sidecar carry `duration`, and message `imeta` may carry `duration` for `audio/wav`. All other audio stays refused (415).
+- fix(git-sign-nostr): signer and owner (`oa[0]`) keys in NIP-GS envelopes and auth tags must be valid BIP-340 curve points; since the nostr 0.44 migration `PublicKey::from_hex` only decoded 32 bytes, so an off-curve owner key was accepted by `parse_envelope` and, at verify time, reported as an unverified attestation instead of the spec's structural `ERRSIG`.
+- fix(relay): the `BUZZ_MESH_DEMO_ECHO` owner consumer no longer drops frames — its 100 ms drain tick cancelled the in-flight `recv_validated` while the fence was being checked in Redis, losing the already-read frame so forwarded joins timed out with 504.
+- fix(buzz-agent): a provider request that fails after `session/cancel` was acknowledged ends the prompt with `stopReason: cancelled` instead of the provider error.
 
 ## v0.5.28
 
