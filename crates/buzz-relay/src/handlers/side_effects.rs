@@ -159,7 +159,38 @@ pub(crate) async fn apply_kick_live_side_effects(
             return Err(e.into());
         }
     }
+    // After the fence commits: revocation needs its own pool connection.
+    revoke_departed_member_huddles(tenant, state, channel_id, target_pubkey).await;
     Ok(())
+}
+
+/// End the departed member's huddle access derived from `channel_id`: close
+/// their audio connections in the channel's room and linked huddle rooms and
+/// revoke their derived huddle-channel memberships (evicting those live
+/// subscriptions too), so they can neither keep listening nor rejoin.
+///
+/// Failures are logged, not propagated: the parent membership removal has
+/// already committed, and huddle admission re-checks membership on rejoin.
+async fn revoke_departed_member_huddles(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    channel_id: Uuid,
+    target_pubkey: &[u8],
+) {
+    match crate::audio::revoke::revoke_huddle_access(tenant, state, channel_id, target_pubkey).await
+    {
+        Ok(sessions) => {
+            for session in sessions {
+                evict_live_channel_subscriptions(tenant, state, session, target_pubkey).await;
+            }
+        }
+        Err(e) => warn!(
+            channel = %channel_id,
+            target = %hex::encode(target_pubkey),
+            error = %e,
+            "Failed to revoke departed member's huddle memberships"
+        ),
+    }
 }
 
 async fn evict_live_channel_subscriptions(
@@ -1529,6 +1560,7 @@ async fn handle_remove_user(
     state.invalidate_membership(tenant, channel_id, &target_pubkey);
     evict_live_channel_subscriptions(tenant, state, channel_id, &target_pubkey).await;
     disable_departed_member_workflows(tenant, state, channel_id, &target_pubkey).await;
+    revoke_departed_member_huddles(tenant, state, channel_id, &target_pubkey).await;
 
     let actor_hex = hex::encode(&actor_bytes);
     let target_hex = hex::encode(&target_pubkey);
@@ -2189,6 +2221,7 @@ async fn handle_leave_request(
     state.invalidate_membership(tenant, channel_id, &actor_bytes);
     evict_live_channel_subscriptions(tenant, state, channel_id, &actor_bytes).await;
     disable_departed_member_workflows(tenant, state, channel_id, &actor_bytes).await;
+    revoke_departed_member_huddles(tenant, state, channel_id, &actor_bytes).await;
 
     let actor_hex = hex::encode(&actor_bytes);
     emit_system_message(

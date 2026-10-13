@@ -1650,11 +1650,9 @@ mod workflows {
     use nostr::{EventBuilder, Keys, Kind, Tag};
 
     /// Workflow definition command (NIP-custom kind 30620). `content` is the
-    /// YAML body; `h` tags the channel. The server *generates* the workflow id
-    /// and returns it in the OK message — it is **not** the `d` tag.
+    /// YAML body; `d` is the client-chosen workflow UUID; `h` tags the channel.
     const KIND_WORKFLOW_DEF: u16 = 30620;
-    /// Workflow trigger command (kind 46020). `d` tag = the server-generated
-    /// workflow id to fire.
+    /// Workflow trigger command (kind 46020). `d` tag = the workflow id to fire.
     const KIND_WORKFLOW_TRIGGER: u16 = 46020;
 
     /// Convert any base form to `http(s)://` for the REST `POST /events` door.
@@ -1741,19 +1739,16 @@ mod workflows {
     }
 
     /// Define a workflow in `channel_id` on `http_base`'s community (kind:30620,
-    /// `h`=channel, content=YAML). Returns the **server-generated** workflow id,
-    /// parsed out of the OK message (`response:{"workflow_id":"…"}`). This id is
-    /// the tenant-scoped handle the trigger door confines: defined under A, it
-    /// only resolves under A.
+    /// `d`=client-chosen workflow UUID, `h`=channel, content=YAML). Returns the
+    /// workflow id the relay acknowledged in the OK message
+    /// (`response:{"workflow_id":"…"}`). The id is a row in the defining
+    /// community only, so it is the tenant-scoped handle the trigger door
+    /// confines: defined under A, it only resolves under A.
     async fn define_workflow(http_base: &str, keys: &Keys, channel_id: &str, name: &str) -> String {
-        // `h` binds the channel; `name` is required by `handle_workflow_def`
-        // (it rejects "missing workflow name" before parsing YAML). We use the
-        // `name` tag, not `d`: the server *generates* the workflow id, and that
-        // generated id — not any client-supplied `d` — is the handle this row
-        // confines. A `d` tag here would falsely imply the trigger resolves by
-        // client key.
+        let workflow_id = uuid::Uuid::new_v4().to_string();
         let event = EventBuilder::new(Kind::Custom(KIND_WORKFLOW_DEF), workflow_yaml(name))
             .tags(vec![
+                Tag::parse(["d", &workflow_id]).unwrap(),
                 Tag::parse(["h", channel_id]).unwrap(),
                 Tag::parse(["name", name]).unwrap(),
             ])
@@ -1793,7 +1788,12 @@ mod workflows {
             .tags(vec![Tag::parse(["d", workflow_id]).unwrap()])
             .sign_with_keys(keys)
             .unwrap();
+        post_command(http_base, keys, event).await
+    }
 
+    /// Submit a command event via `POST /events` and normalize the outcome to
+    /// `{accepted, message}` (HTTP 400 `{error}` → `accepted: false`).
+    async fn post_command(http_base: &str, keys: &Keys, event: nostr::Event) -> serde_json::Value {
         let client = reqwest::Client::new();
         let resp = client
             .post(format!("{http_base}/events"))
@@ -1802,12 +1802,11 @@ mod workflows {
             .body(serde_json::to_string(&event).expect("serialize event"))
             .send()
             .await
-            .unwrap_or_else(|e| panic!("POST workflow trigger to {http_base} failed: {e}"));
+            .unwrap_or_else(|e| panic!("POST command to {http_base} failed: {e}"));
         let status = resp.status();
-        let body = resp.text().await.expect("read workflow trigger body");
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|e| {
-            panic!("parse workflow trigger JSON from {http_base}: {e} (body: {body})")
-        });
+        let body = resp.text().await.expect("read command body");
+        let parsed: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("parse command JSON from {http_base}: {e} (body: {body})"));
         if status.is_success() {
             return parsed;
         }
@@ -1817,7 +1816,7 @@ mod workflows {
                 "message": parsed["error"].as_str().unwrap_or_default(),
             });
         }
-        panic!("POST workflow trigger to {http_base} returned HTTP {status}: {body}");
+        panic!("POST command to {http_base} returned HTTP {status}: {body}");
     }
 
     /// Obligation (trigger-confinement half): a workflow id defined under
@@ -1836,8 +1835,8 @@ mod workflows {
     ///      as owner-member of `U` on *each* side (`create_channel_with_id`).
     ///      This deliberately removes "not a member of U in B" as an alternate
     ///      cause of the B rejection — K *is* a member of U in B.
-    ///   2. Define a workflow in `U` under **A** (kind:30620). The server
-    ///      generates `W` and returns it. `W` is an A-community row.
+    ///   2. Define a workflow `W` in `U` under **A** (kind:30620, `d`=W). `W`
+    ///      is an A-community row.
     ///   3. Fire `W` under host **B** (kind:46020, `d`=W) as K. Must be
     ///      rejected — `accepted == false` and the generic `workflow not found`
     ///      message — because `get_workflow(B_community, W)` finds nothing: `W`
@@ -1858,16 +1857,8 @@ mod workflows {
     /// assertion goes RED. Restore the `community_id` argument → GREEN. This is
     /// the exact invariant commit `c81b89355` documents at that call site.
     ///
-    /// NOTE — approval-token isolation is a **separate, not-yet-wire-live**
-    /// obligation, deliberately left as a `pending_lane` below. The grant
-    /// handler (`get_approval_by_stored_hash(community, hash)`) is already
-    /// community-scoped, but nothing *mints* a pending approval over the wire:
-    /// the executor's approval gate is an explicit TODO
-    /// (`crates/buzz-workflow/src/lib.rs` — "approval gates not yet implemented,
-    /// see WF-08") and `create_approval` is only reached from unit tests. A
-    /// green end-to-end approval-isolation test therefore cannot be exercised
-    /// today; writing one would violate this file's contract (a green run can
-    /// never be faked by an empty/DB-only body). It lands with WF-08.
+    /// The approval-token half of this row is
+    /// [`approval_token_is_community_confined`] below.
     #[tokio::test]
     #[ignore]
     async fn workflow_trigger_is_community_confined() {
@@ -1886,12 +1877,12 @@ mod workflows {
         let chan_b = create_open_channel(&http_b, &keys, shared_uuid).await;
         assert_eq!(chan_a, chan_b, "channels must share UUID — test design");
 
-        // (2) Define the workflow under A. Server generates W.
+        // (2) Define the workflow W under A.
         let name = format!("wfconf_{}", uuid::Uuid::new_v4().simple());
         let workflow_id = define_workflow(&http_a, &keys, &chan_a, &name).await;
         assert!(
             uuid::Uuid::parse_str(&workflow_id).is_ok(),
-            "server-generated workflow_id must be a UUID, got {workflow_id:?}"
+            "acknowledged workflow_id must be a UUID, got {workflow_id:?}"
         );
 
         // (3) Fire W under host B as K. Must fail closed: W is an A-community
@@ -1925,26 +1916,220 @@ mod workflows {
         );
     }
 
-    /// Obligation (approval-token half): an approval token (its stored hash)
-    /// minted under community A cannot be satisfied by a grant on host B, and
-    /// vice versa. The grant resolution is already community-scoped
-    /// (`get_approval_by_stored_hash(community, hash)`), but this half is
-    /// **not wire-live**: nothing mints a pending approval over the wire yet —
-    /// the executor approval gate is an explicit TODO (WF-08), and
-    /// `create_approval` is reached only from unit tests. Left as a precise
-    /// `pending_lane` so the WF-08 owner fills in *their* row; a green run can
-    /// never be faked by a DB-only/empty body. Depends on WF-08 (approval
-    /// minting), **not** buzz-db — the scoping fence it will exercise is
-    /// already landed.
+    /// NIP-98 `Authorization` header for a signed GET of exactly `url`.
+    fn nip98_get(keys: &Keys, url: &str) -> String {
+        use base64::Engine;
+        let event = EventBuilder::new(Kind::Custom(27_235), "")
+            .tags(vec![
+                Tag::parse(["u", url]).unwrap(),
+                Tag::parse(["method", "GET"]).unwrap(),
+                Tag::parse(["nonce", &uuid::Uuid::new_v4().to_string()]).unwrap(),
+            ])
+            .sign_with_keys(keys)
+            .unwrap();
+        format!(
+            "Nostr {}",
+            base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_string(&event).expect("serialize NIP-98 event"))
+        )
+    }
+
+    /// NIP-98 signed GET of a workflow read route on `http_base`'s community.
+    async fn signed_get(http_base: &str, keys: &Keys, path: &str) -> serde_json::Value {
+        let url = format!("{http_base}{path}");
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .header("Authorization", nip98_get(keys, &url))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("GET {url} failed: {e}"));
+        let status = resp.status();
+        let body = resp.text().await.expect("read workflow read body");
+        assert!(status.is_success(), "GET {url} returned {status}: {body}");
+        serde_json::from_str(&body).unwrap_or_else(|e| panic!("parse {url}: {e} ({body})"))
+    }
+
+    /// Create private channel `channel_uuid` on `http_base`'s community with
+    /// `owner` as owner and `member` added (kind 9007 + 9000).
+    async fn create_private_channel_with_member(
+        http_base: &str,
+        owner: &Keys,
+        member: &Keys,
+        channel_uuid: uuid::Uuid,
+    ) {
+        let channel = channel_uuid.to_string();
+        let create = EventBuilder::new(Kind::Custom(9007), "")
+            .tags(vec![
+                Tag::parse(["h", &channel]).unwrap(),
+                Tag::parse(["name", &format!("conformance-approval-{channel_uuid}")]).unwrap(),
+                Tag::parse(["channel_type", "stream"]).unwrap(),
+                Tag::parse(["visibility", "private"]).unwrap(),
+            ])
+            .sign_with_keys(owner)
+            .unwrap();
+        let body = submit_event(http_base, owner, create).await;
+        assert!(
+            body["accepted"].as_bool().unwrap_or(false),
+            "{http_base}: {body}"
+        );
+        let add = EventBuilder::new(Kind::Custom(9000), "")
+            .tags(vec![
+                Tag::parse(["h", &channel]).unwrap(),
+                Tag::parse(["p", &member.public_key().to_hex()]).unwrap(),
+            ])
+            .sign_with_keys(owner)
+            .unwrap();
+        let body = submit_event(http_base, owner, add).await;
+        assert!(
+            body["accepted"].as_bool().unwrap_or(false),
+            "{http_base}: {body}"
+        );
+    }
+
+    /// The single run of `workflow_id`, polled until it leaves `pending`/`running`.
+    async fn settled_run(http_base: &str, reader: &Keys, workflow_id: &str) -> serde_json::Value {
+        let path = format!("/workflows/{workflow_id}/runs");
+        let mut last = serde_json::Value::Null;
+        for _ in 0..150 {
+            let body = signed_get(http_base, reader, &path).await;
+            if let Some(run) = body["runs"].as_array().and_then(|runs| runs.first()) {
+                last = run.clone();
+                let state = run["status"].as_str().unwrap_or_default();
+                if state != "pending" && state != "running" {
+                    return last;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        panic!("workflow run did not settle within 30s; last observed: {last}");
+    }
+
+    fn decision(keys: &Keys, kind: u16, approval_ref: &str) -> nostr::Event {
+        EventBuilder::new(Kind::Custom(kind), "")
+            .tags(vec![Tag::parse(["d", approval_ref]).unwrap()])
+            .sign_with_keys(keys)
+            .unwrap()
+    }
+
+    /// Obligation (approval-token half): an approval minted under community A
+    /// cannot be decided through host B. Decision resolution is
+    /// `get_approval_by_stored_hash(host_community, hash)`, so B finds nothing
+    /// even for the designated approver.
+    ///
+    /// Wire-observable shape (owner O, approver K; the fence under test must be
+    /// `community_id`, never pubkey or membership):
+    ///   1. Create the **same** private channel UUID `U` in A and in B, with K
+    ///      a member on both sides — "not a member of U in B" cannot explain a
+    ///      B rejection.
+    ///   2. Under A, O defines a workflow in `U` whose `request_approval` step
+    ///      designates K, and triggers it. The run suspends `waiting_approval`
+    ///      and the read model exposes one pending approval `R` (A's token).
+    ///   3. K grants and denies `R` under host **B**: both rejected with the
+    ///      generic `approval not found`, and under A the run is still
+    ///      `waiting_approval` with `R` still pending — B wrote nothing.
+    ///   4. K grants `R` under host **A**: accepted and the run completes —
+    ///      proving `R` was a live, grantable token, so (3) is confinement.
+    ///
+    /// Mutate-bite: resolve the decision's approval without the community
+    /// (bare-hash lookup) in `handle_approval_decision`
+    /// (`crates/buzz-relay/src/handlers/command_executor.rs`) → step 3's B grant
+    /// finds A's pending approval, K passes the designated-approver check and
+    /// the decision is accepted → RED.
     #[tokio::test]
     #[ignore]
     async fn approval_token_is_community_confined() {
-        pending_lane(
-            "WF-08 (approval minting)",
-            "an approval token minted under A cannot be satisfied by a grant on host B — \
-             blocked until the executor approval gate (WF-08) mints pending approvals over \
-             the wire; the get_approval_by_stored_hash(community, hash) fence is already landed",
+        const KIND_APPROVAL_GRANT: u16 = 46030;
+        const KIND_APPROVAL_DENY: u16 = 46031;
+        let http_a = to_http(&url_a());
+        let http_b = to_http(&url_b());
+        let owner = Keys::generate();
+        let approver = Keys::generate();
+        let approver_hex = approver.public_key().to_hex();
+
+        // (1) Same private channel UUID on both hosts, approver a member of each.
+        let shared_uuid = uuid::Uuid::new_v4();
+        create_private_channel_with_member(&http_a, &owner, &approver, shared_uuid).await;
+        create_private_channel_with_member(&http_b, &owner, &approver, shared_uuid).await;
+        let channel = shared_uuid.to_string();
+
+        // (2) Mint a pending approval under A.
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let yaml = format!(
+            "name: approval-confinement-{nonce}\n\
+             trigger:\n  on: webhook\n\
+             steps:\n\
+             \x20 - id: gate\n    action: request_approval\n    from: '{approver_hex}'\n    message: 'Confine {nonce}?'\n    timeout: 1h\n\
+             \x20 - id: after\n    action: send_message\n    text: 'approved {nonce}'\n"
         );
+        let workflow_id = uuid::Uuid::new_v4().to_string();
+        let definition = EventBuilder::new(Kind::Custom(KIND_WORKFLOW_DEF), yaml)
+            .tags(vec![
+                Tag::parse(["d", &workflow_id]).unwrap(),
+                Tag::parse(["h", &channel]).unwrap(),
+            ])
+            .sign_with_keys(&owner)
+            .unwrap();
+        let body = submit_event(&http_a, &owner, definition).await;
+        assert!(
+            body["accepted"].as_bool().unwrap_or(false),
+            "definition: {body}"
+        );
+        let trigger = EventBuilder::new(Kind::Custom(KIND_WORKFLOW_TRIGGER), "{}")
+            .tags(vec![Tag::parse(["d", &workflow_id]).unwrap()])
+            .sign_with_keys(&owner)
+            .unwrap();
+        let body = post_command(&http_a, &owner, trigger).await;
+        assert_eq!(body["accepted"].as_bool(), Some(true), "trigger: {body}");
+
+        let run = settled_run(&http_a, &approver, &workflow_id).await;
+        assert_eq!(run["status"], "waiting_approval", "{run}");
+        let run_id = run["id"].as_str().expect("run id").to_string();
+        let approvals_path = format!("/workflows/{workflow_id}/runs/{run_id}/approvals");
+        let approvals = signed_get(&http_a, &approver, &approvals_path).await;
+        let approvals = approvals["approvals"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(approvals.len(), 1, "one minted approval: {approvals:?}");
+        assert_eq!(approvals[0]["status"], "pending");
+        let approval_ref = approvals[0]["approval_ref"]
+            .as_str()
+            .expect("approval ref")
+            .to_string();
+
+        // (3) The designated approver cannot decide A's token through host B.
+        for kind in [KIND_APPROVAL_GRANT, KIND_APPROVAL_DENY] {
+            let resp =
+                post_command(&http_b, &approver, decision(&approver, kind, &approval_ref)).await;
+            assert_eq!(
+                resp["accepted"].as_bool(),
+                Some(false),
+                "host B decided an A-community approval (kind {kind}): {resp}"
+            );
+            let message = resp["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains("approval not found"),
+                "host B rejection must be the generic `approval not found`; got {message:?}"
+            );
+        }
+        let run = settled_run(&http_a, &approver, &workflow_id).await;
+        assert_eq!(run["status"], "waiting_approval", "B wrote nothing: {run}");
+        let approvals = signed_get(&http_a, &approver, &approvals_path).await;
+        assert_eq!(
+            approvals["approvals"][0]["status"], "pending",
+            "{approvals}"
+        );
+
+        // (4) Positive control: the same token is grantable under A.
+        let resp = post_command(
+            &http_a,
+            &approver,
+            decision(&approver, KIND_APPROVAL_GRANT, &approval_ref),
+        )
+        .await;
+        assert_eq!(resp["accepted"].as_bool(), Some(true), "A grant: {resp}");
+        let run = settled_run(&http_a, &approver, &workflow_id).await;
+        assert_eq!(run["status"], "completed", "granted run completes: {run}");
     }
 }
 

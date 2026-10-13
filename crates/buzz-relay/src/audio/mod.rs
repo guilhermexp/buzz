@@ -12,6 +12,7 @@
 pub mod handler;
 pub mod join;
 pub mod mesh;
+pub mod revoke;
 pub mod room;
 pub mod wire;
 

@@ -676,6 +676,8 @@ Real-time voice lives inside `buzz-relay` (`src/audio/`), not a separate crate. 
 
 **Lifecycle events:** the relay emits Nostr events for participant joined / left and huddle ended; the desktop client emits huddle started and guidelines. When the last peer leaves, the room ends and the channel archives atomically.
 
+**Revocation:** huddle access derives from channel membership. When a member is removed from a channel, leaves it, or is kicked, the relay revokes their memberships in the ephemeral huddle channels linked to it (creator-signed huddle started), sends their audio sockets in those rooms (and the channel's own room) a final `{"type":"error","code":"membership_revoked",…}` frame and closes them; the normal leave path then broadcasts `left` and emits the participant-left event. A rejoin is refused (`not a member`): neither the revoked huddle membership nor auto-add from the parent admits it, and a join admitted from a membership revoked mid-admission fails its commit re-check. Socket termination is pod-local; the durable membership writes refuse the member on every pod. A community ban closes every socket of the member, audio included.
+
 **Not yet built:** recording and per-track publishing (the corresponding kinds are reserved, no producer exists).
 
 ---
