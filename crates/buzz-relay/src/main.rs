@@ -4785,9 +4785,40 @@ mod composition_tests {
     // at timer-fire T=121, source sees T=61 < T=90 → snapshot live → callback
     // returns true → no warn! → path-4 assertion fails.
     //
-    // Uses `#[test]` + manual runtime so `with_default` wraps all async execution.
+    // Uses a manual runtime so `with_default` wraps all async execution.
+    //
+    // Isolation: tracing caches callsite interest process-wide. While this
+    // test's scoped subscriber is the only registered dispatcher, tracing-core
+    // computes a newly hit callsite's interest from the *registering thread's*
+    // default dispatcher. A concurrent test (e.g. the `jwks_refresh_*` tests)
+    // that first hits a shared callsite such as buzz-auth's fetch-fail `warn!`
+    // on a thread without a subscriber caches `Interest::never`, and the event
+    // is then silently dropped here. The capture therefore runs in a child
+    // process of this test binary that executes only this test.
     #[test]
     fn composition_log_does_not_leak_issuer_url() {
+        const CHILD_ENV: &str = "BUZZ_RELAY_LOG_PRIVACY_CHILD";
+        const TEST_NAME: &str = "composition_tests::composition_log_does_not_leak_issuer_url";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            assert_composition_log_does_not_leak_issuer_url();
+            return;
+        }
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(exe)
+            .args([TEST_NAME, "--exact", "--test-threads=1", "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("spawn isolated log privacy test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "isolated log privacy test failed ({}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+    }
+
+    fn assert_composition_log_does_not_leak_issuer_url() {
         use std::io::Write;
 
         // Sentinel must be lowercase: JwksSourceContract::new() canonicalizes
