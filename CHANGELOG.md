@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased (guilhermexp/buzz fork)
+
+- feat(workflow): durable approval gates — suspension with a pending approval and relay-signed kind:46010 request, designated-approver decisions committed atomically with 46011/46012 notices, expiry, run leases with per-step checkpoints and crash recovery that resumes runs exactly once (migration 0061).
+- feat(cli): `buzz workflows approve --token` accepts the published 64-hex approval reference.
+
 ## v0.5.28
 
 ### Desktop and shared changes

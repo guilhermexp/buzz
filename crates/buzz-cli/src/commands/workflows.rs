@@ -202,6 +202,21 @@ pub async fn cmd_trigger_workflow(
     Ok(())
 }
 
+/// Resolve `--token` to the approval reference used as the decision's `d` tag.
+///
+/// Approvers usually only see the reference: the 64-hex SHA-256 of the raw
+/// token, published as the `d` tag of the kind:46010 request and as
+/// `approval_ref` in the runs API. A raw token UUID is hashed for callers that
+/// hold it.
+fn approval_reference(token_or_reference: &str) -> Result<String, CliError> {
+    let value = token_or_reference.trim();
+    if value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Ok(value.to_ascii_lowercase());
+    }
+    validate_uuid(value)?;
+    Ok(hex::encode(Sha256::digest(value.as_bytes())))
+}
+
 /// Approve or deny a workflow step — sign and submit a kind:46030 (grant) or 46031 (deny) event.
 pub async fn cmd_approve_step(
     client: &BuzzClient,
@@ -209,14 +224,10 @@ pub async fn cmd_approve_step(
     approved: bool,
     note: Option<&str>,
 ) -> Result<(), CliError> {
-    validate_uuid(approval_token)?;
-
+    let reference = approval_reference(approval_token)?;
     let content = note.unwrap_or("");
-
-    // The relay expects d-tag = hex(SHA256(token)), not the raw token UUID.
-    let token_hash = hex::encode(Sha256::digest(approval_token.as_bytes()));
     let builder =
-        buzz_sdk::build_workflow_approval(&token_hash, approved, content).map_err(sdk_err)?;
+        buzz_sdk::build_workflow_approval(&reference, approved, content).map_err(sdk_err)?;
     let event = client.sign_event(builder)?;
 
     let resp = client.submit_event(event).await?;
@@ -252,5 +263,24 @@ pub async fn dispatch(cmd: crate::WorkflowsCmd, client: &BuzzClient) -> Result<(
             // approved is already a bool — no parse_bool_flag needed
             cmd_approve_step(client, &token, approved, note.as_deref()).await
         }
+    }
+}
+
+#[cfg(test)]
+mod approval_reference_tests {
+    use super::approval_reference;
+
+    #[test]
+    fn accepts_a_published_reference_unchanged_and_hashes_raw_tokens() {
+        let reference = "AB".repeat(32);
+        assert_eq!(
+            approval_reference(&reference).expect("reference"),
+            "ab".repeat(32)
+        );
+        assert_eq!(
+            approval_reference("00000000-0000-0000-0000-000000000000").expect("token"),
+            "12b9377cbe7e5c94e8a70d9d23929523d14afa954793130f8a3959c7b849aca8"
+        );
+        assert!(approval_reference("not-a-token").is_err());
     }
 }

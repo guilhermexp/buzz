@@ -250,7 +250,7 @@ If Buzz disappears tomorrow, your repos still work on gitworkshop.dev, your patc
 | Workflow engine (triggers, traces, conditional logic) | ✅ Ships today |
 | MCP server + ACP agent harness | ✅ Ships today |
 | Blossom media storage (SHA-256, S3) | ✅ Ships today |
-| Approval gates | 🚧 Infrastructure exists; executor wiring in progress |
+| Approval gates | ✅ Ships today (durable suspension, approve/deny/expiry, crash-safe resume) |
 | Project binding (kind:30617 + `buzz-` tags) | 📋 Designed |
 | Multi-repo projects (kind:30621, [NIP-MP](docs/nips/NIP-MP.md)) | 📋 Designed |
 | Git hosting (smart HTTP + NIP-34) | ✅ Ships today |

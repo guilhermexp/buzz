@@ -412,12 +412,14 @@ buzz workflows trigger --workflow "$WF_ID" | jq .
 buzz workflows runs --workflow "$WF_ID" | jq .
 # Expected: [] — relay stores runs in DB, not as Nostr events; empty is normal
 
-# workflows approve — requires a workflow run waiting for approval
-# This is hard to test ad-hoc without a workflow that has an approval gate.
-# Test the validation instead:
-buzz workflows approve --token "00000000-0000-0000-0000-000000000000" 2>&1 || true
-# Should fail with relay error (token not found), not a validation error
-# To test the deny path: buzz workflows approve --token <UUID> --approved false
+# workflows approve — needs a run waiting for approval. Create a workflow with a
+# `request_approval` step whose `from` is the approver's hex pubkey, trigger it,
+# then read the reference from `buzz workflows runs` (approval_ref) or from the
+# kind:46010 request's `d` tag:
+buzz workflows approve --token <APPROVAL_REF>
+# The run resumes (status running → completed). Deny path:
+# buzz workflows approve --token <APPROVAL_REF> --approved false   (run → cancelled)
+# A second decision on the same reference fails with "approval already granted/denied".
 
 # workflows delete
 buzz workflows delete --workflow "$WF_ID" | jq .
@@ -604,7 +606,7 @@ buzz channels delete --channel "$FORUM_ID" | jq .
 | 39 | `workflows trigger` | ☐ | |
 | 40 | `workflows runs` | ☐ | |
 | 41 | `workflows get` | ☐ | |
-| 42 | `workflows approve` | ☐ | Validation only (needs approval gate); bare = approve, `--approved false` = deny |
+| 42 | `workflows approve` | ☐ | Needs a waiting run; `--token` takes the 64-hex approval_ref (or raw token UUID); bare = approve, `--approved false` = deny |
 | 43 | `feed get` | ☐ | |
 | 44 | `social publish` | ☐ | |
 | 45 | `social set-contacts` | ☐ | |
