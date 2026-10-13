@@ -816,5 +816,5 @@ Record behavioral RED/GREEN for fixes and keep real acceptance separate from UI 
 ### Build
 
 ```json
-{"command": ["cargo", "build", "--locked", "--release", "-p", "buzz-relay", "-p", "buzz-cli", "-p", "buzz-admin", "-p", "buzz-acp", "-p", "buzz-agent", "-p", "buzz-dev-mcp"], "cwd": "."}
+{"command": {"argv": ["cargo", "build", "--locked", "--release", "-p", "buzz-relay", "-p", "buzz-cli", "-p", "buzz-admin", "-p", "buzz-acp", "-p", "buzz-agent", "-p", "buzz-dev-mcp"], "cwd": "."}}
 ```
