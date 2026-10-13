@@ -476,8 +476,12 @@ pub enum StepResult {
     Completed(JsonValue),
     /// Step requests suspension (approval gate). Execution must pause.
     Suspended {
-        /// Token used to resume or reject this approval gate.
-        approval_token: String,
+        /// Normalized approver: a lowercase hex pubkey or `any`.
+        approver_spec: String,
+        /// Rendered request shown to the approver.
+        message: String,
+        /// Decision window in seconds.
+        timeout_secs: u64,
     },
     /// Step was skipped due to `if:` condition being false.
     Skipped,
@@ -534,6 +538,11 @@ fn resolve_send_message_channel(
 ///
 /// `RequestApproval` returns `StepResult::Suspended` — the caller must
 /// persist state and stop the execution loop.
+///
+/// `attempt_at` is the persisted first-attempt time of this step. Re-running a
+/// step after a crash with the same value makes `send_message` produce the
+/// identical event (deduplicated by id) and gives webhooks a stable
+/// idempotency key, so recovery does not duplicate side effects.
 pub async fn dispatch_action(
     step: &Step,
     action: &ActionDef,
@@ -541,6 +550,7 @@ pub async fn dispatch_action(
     community_id: CommunityId,
     run_id: Uuid,
     trigger_ctx: &TriggerContext,
+    attempt_at: Option<u64>,
 ) -> Result<StepResult, WorkflowError> {
     use ActionDef::*;
 
@@ -633,6 +643,11 @@ pub async fn dispatch_action(
                             ));
                         }
                     };
+                    let idempotency =
+                        attempt_at.map(|created_at| crate::action_sink::StepIdempotency {
+                            step_key: format!("{run_id}:{step_id}"),
+                            created_at,
+                        });
                     let event_id = engine
                         .action_sink()?
                         .send_message(
@@ -642,6 +657,7 @@ pub async fn dispatch_action(
                             authored_text,
                             &owner_pubkey_hex,
                             reply_to,
+                            idempotency,
                         )
                         .await
                         .map_err(WorkflowError::from)?;
@@ -702,7 +718,10 @@ pub async fn dispatch_action(
 
                     #[cfg(feature = "reqwest")]
                     {
-                        let result = call_webhook_impl(url, method_str, headers, body).await?;
+                        let idempotency_key = format!("{run_id}:{step_id}");
+                        let result =
+                            call_webhook_impl(url, method_str, headers, body, &idempotency_key)
+                                .await?;
                         Ok(StepResult::Completed(result))
                     }
 
@@ -727,19 +746,22 @@ pub async fn dispatch_action(
                     message,
                     timeout,
                 } => {
-                    let timeout_str = timeout.as_deref().unwrap_or("24h");
+                    let timeout_secs = parse_duration_secs(timeout.as_deref().unwrap_or("24h"))?;
+                    if timeout_secs == 0 || timeout_secs > MAX_APPROVAL_TIMEOUT_SECS {
+                        return Err(WorkflowError::InvalidDefinition(format!(
+                            "request_approval: timeout must be between 1s and \
+                             {MAX_APPROVAL_TIMEOUT_SECS}s (got {timeout_secs}s)"
+                        )));
+                    }
+                    let approver_spec = normalize_approver_spec(from)?;
                     info!(
                         run_id = %run_id, step = step_id,
-                        "RequestApproval from={from} timeout={timeout_str}: {message}"
+                        "RequestApproval timeout={timeout_secs}s"
                     );
-
-                    let token = generate_approval_token(run_id, step_id);
-
-                    // TODO (WF-08): create approval record in DB, emit kind:46010.
-                    // For now, return Suspended with the token so the caller can persist state.
-
                     Ok(StepResult::Suspended {
-                        approval_token: token,
+                        approver_spec,
+                        message: message.clone(),
+                        timeout_secs,
                     })
                 }
 
@@ -785,11 +807,39 @@ pub async fn dispatch_action(
 /// Generate a cryptographically random approval token.
 ///
 /// Uses `Uuid::new_v4()` which draws from the OS CSPRNG (via the `getrandom`
-/// crate). The `run_id` and `step_id` parameters are accepted for logging
-/// context but are not mixed into the token — the UUID's own randomness is
-/// sufficient and avoids the predictability of time-based entropy.
-fn generate_approval_token(_run_id: Uuid, _step_id: &str) -> String {
+/// crate); the token is stored only as its SHA-256 hash.
+fn generate_approval_token() -> String {
     Uuid::new_v4().to_string()
+}
+
+/// Longest decision window a gate may request (30 days).
+pub const MAX_APPROVAL_TIMEOUT_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// Normalize a `request_approval.from` value to the stored approver spec.
+///
+/// Accepted: a 64-char hex pubkey, an `npub`, or `any` (any current member of
+/// the workflow channel). Role mentions are rejected here rather than parked
+/// as an approval nobody can satisfy.
+pub fn normalize_approver_spec(from: &str) -> Result<String, WorkflowError> {
+    let spec = from.trim();
+    if spec.eq_ignore_ascii_case("any") {
+        return Ok("any".to_owned());
+    }
+    if spec.len() == 64 && spec.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Ok(spec.to_ascii_lowercase());
+    }
+    if spec.starts_with("npub1") {
+        return nostr::PublicKey::parse(spec)
+            .map(|key| key.to_hex())
+            .map_err(|_| {
+                WorkflowError::InvalidDefinition(
+                    "request_approval: `from` is not a valid npub".into(),
+                )
+            });
+    }
+    Err(WorkflowError::InvalidDefinition(
+        "request_approval: `from` must be a pubkey, an npub, or `any`".into(),
+    ))
 }
 
 /// Parse a duration string like "5m", "1h", "30s" into seconds.
@@ -876,6 +926,7 @@ async fn call_webhook_impl(
     method: &str,
     headers: &Option<std::collections::HashMap<String, String>>,
     body: &Option<String>,
+    idempotency_key: &str,
 ) -> Result<JsonValue, WorkflowError> {
     use reqwest::Client;
     use std::time::Duration;
@@ -910,7 +961,11 @@ async fn call_webhook_impl(
     let method_parsed = reqwest::Method::from_bytes(method.as_bytes())
         .map_err(|e| WorkflowError::WebhookError(e.to_string()))?;
 
-    let mut req = client.request(method_parsed, url);
+    // Recovery may re-deliver a step that was in flight when its executor
+    // died; receivers can deduplicate on this per-run, per-step key.
+    let mut req = client
+        .request(method_parsed, url)
+        .header("Idempotency-Key", idempotency_key);
 
     if let Some(hdrs) = headers {
         for (k, v) in hdrs {
@@ -1025,170 +1080,160 @@ async fn add_reaction_impl(message_id: &str, emoji: &str) -> Result<JsonValue, W
     }))
 }
 
-/// Rich return type from `execute_run` / `execute_from_step`.
-///
-/// Carries enough information for the caller to:
-/// - Persist the approval record when suspended at a `RequestApproval` step.
-/// - Update the run's execution trace and current step in the DB.
-/// - Resume execution from the correct step after approval.
+/// A run paused at a `request_approval` gate, ready to be persisted.
+#[derive(Debug, Clone)]
+pub struct ApprovalRequest {
+    /// Fresh random token; only its hash is persisted.
+    pub token: String,
+    /// Gate step id.
+    pub step_id: String,
+    /// Gate step index.
+    pub step_index: usize,
+    /// Normalized approver spec (hex pubkey or `any`).
+    pub approver_spec: String,
+    /// Rendered request text.
+    pub message: String,
+    /// Decision window in seconds.
+    pub timeout_secs: u64,
+}
+
+/// Outcome of executing a run's steps.
 #[derive(Debug)]
 pub struct ExecutionResult {
-    /// Set when execution suspended at a `RequestApproval` step.
-    /// `None` means the run completed normally.
-    pub approval_token: Option<String>,
-    /// Index of the step that suspended (or the total step count on completion).
+    /// Set when execution suspended at a `request_approval` step.
+    pub suspension: Option<ApprovalRequest>,
+    /// Index of the step that suspended, or the step count on completion.
     pub step_index: usize,
     /// Accumulated step outputs at the point of suspension or completion.
     pub step_outputs: HashMap<String, JsonValue>,
-    /// Execution trace: one entry per completed/skipped step.
+    /// Complete run trace: restored checkpoints plus this execution.
     pub trace: Vec<JsonValue>,
 }
 
-/// Execute a workflow run sequentially.
-///
-/// Steps run in order. Each step:
-/// 1. Evaluates `if:` condition (skip if false).
-/// 2. Resolves template variables in action fields.
-/// 3. Dispatches the action.
-/// 4. Stores the step output for use by later steps.
-///
-/// On `RequestApproval`: returns `ExecutionResult` with `approval_token = Some(token)`.
-/// Caller must persist the approval record and update the run status.
-///
-/// Returns `ExecutionResult` with `approval_token = None` on normal completion.
-///
-/// Enforces `engine.config.max_concurrent` via a semaphore — returns
-/// [`WorkflowError::CapacityExceeded`] immediately if all permits are taken.
-/// Transitions the run to `Running` after acquiring a permit.
-pub async fn execute_run(
-    engine: &WorkflowEngine,
-    community_id: CommunityId,
-    run_id: Uuid,
-    def: &WorkflowDef,
-    trigger_ctx: &TriggerContext,
-) -> Result<ExecutionResult, (WorkflowError, crate::error::PartialProgress)> {
-    // Fail fast if all concurrency permits are in use — no queuing.
-    let _permit = engine.run_semaphore.try_acquire().map_err(|_| {
-        (
-            WorkflowError::CapacityExceeded,
-            crate::error::PartialProgress::default(),
-        )
-    })?;
-
-    engine
-        .db
-        .update_workflow_run(
-            community_id,
-            run_id,
-            buzz_db::workflow::RunStatus::Running,
-            0,
-            &serde_json::json!([]),
-            None,
-        )
-        .await
-        .map_err(|e| {
-            (
-                WorkflowError::from(e),
-                crate::error::PartialProgress::default(),
-            )
-        })?;
-
-    execute_steps(engine, community_id, run_id, def, trigger_ctx, 0, None).await
+/// Where a run's execution (re)starts.
+#[derive(Debug, Clone, Default)]
+pub struct RunCursor {
+    /// First step to execute.
+    pub start_index: usize,
+    /// Outputs of steps already completed, for template resolution.
+    pub outputs: HashMap<String, JsonValue>,
+    /// Trace entries already persisted.
+    pub trace: Vec<JsonValue>,
+    /// First-attempt time of a side-effect step interrupted mid-dispatch.
+    pub interrupted_attempt_at: Option<u64>,
 }
 
-/// Resume execution from a specific step index (used for approval resume).
-///
-/// Acquires a concurrency permit from `engine.run_semaphore` before executing —
-/// returns [`WorkflowError::CapacityExceeded`] immediately if all permits are
-/// taken.
-///
-/// Transitions the run to `Running` after acquiring a permit, so that
-/// approval-resumed runs correctly reflect their active state.
-///
-/// `initial_outputs` should be reconstructed from the execution trace before
-/// calling this function on resume, so that steps after the resume point can
-/// reference `{{steps.PREV_STEP.output.X}}` correctly.
-pub async fn execute_from_step(
-    engine: &WorkflowEngine,
-    community_id: CommunityId,
-    run_id: Uuid,
-    def: &WorkflowDef,
-    trigger_ctx: &TriggerContext,
-    start_index: usize,
-    initial_outputs: Option<HashMap<String, JsonValue>>,
-) -> Result<ExecutionResult, (WorkflowError, crate::error::PartialProgress)> {
-    // Fail fast if all concurrency permits are in use — no queuing.
-    let _permit = engine.run_semaphore.try_acquire().map_err(|_| {
-        (
-            WorkflowError::CapacityExceeded,
-            crate::error::PartialProgress::default(),
-        )
-    })?;
-
-    // Mark run as Running now that we have a permit (resume from approval).
-    // Preserve the existing execution trace from pre-approval steps.
-    let existing_trace = match engine.db.get_workflow_run(community_id, run_id).await {
-        Ok(r) => r.execution_trace,
-        Err(e) => {
-            warn!(
-                run_id = %run_id,
-                "Failed to read existing trace for resume — pre-approval trace will be lost: {e}"
-            );
-            serde_json::json!([])
+impl RunCursor {
+    /// Rebuild a cursor from a run's persisted checkpoint.
+    pub fn from_checkpoint(current_step: i32, trace: &JsonValue) -> Self {
+        let mut entries = trace.as_array().cloned().unwrap_or_default();
+        let interrupted = entries
+            .last()
+            .and_then(|entry| entry.get("status"))
+            .and_then(JsonValue::as_str)
+            == Some("dispatching");
+        let interrupted_attempt_at = if interrupted {
+            entries
+                .pop()
+                .and_then(|entry| entry.get("at").and_then(JsonValue::as_u64))
+        } else {
+            None
+        };
+        let outputs = entries
+            .iter()
+            .filter_map(|entry| {
+                Some((
+                    entry.get("step_id")?.as_str()?.to_owned(),
+                    entry.get("output")?.clone(),
+                ))
+            })
+            .collect();
+        Self {
+            start_index: usize::try_from(current_step).unwrap_or(0),
+            outputs,
+            trace: entries,
+            interrupted_attempt_at,
         }
-    };
-    engine
-        .db
-        .update_workflow_run(
-            community_id,
-            run_id,
-            buzz_db::workflow::RunStatus::Running,
-            start_index as i32,
-            &existing_trace,
-            None,
-        )
-        .await
-        .map_err(|e| {
-            (
-                WorkflowError::from(e),
-                crate::error::PartialProgress::default(),
-            )
-        })?;
-
-    execute_steps(
-        engine,
-        community_id,
-        run_id,
-        def,
-        trigger_ctx,
-        start_index,
-        initial_outputs,
-    )
-    .await
+    }
 }
 
-/// Internal: execute workflow steps starting from `start_index`, without
-/// acquiring the semaphore. Called by both [`execute_run`] and
-/// [`execute_from_step`] after they have already acquired a permit.
+/// Executor-side view of a run lease. `lost` is raised by the renewal task
+/// when ownership can no longer be confirmed.
+#[derive(Debug, Clone)]
+pub struct LeaseHandle {
+    /// Lease owner identity (the engine instance).
+    pub owner: Uuid,
+    /// Set once renewal fails; execution stops before the next step.
+    pub lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+async fn checkpoint(
+    engine: &WorkflowEngine,
+    community_id: CommunityId,
+    run_id: Uuid,
+    lease: Option<&LeaseHandle>,
+    next_step: usize,
+    trace: &[JsonValue],
+) -> Result<(), WorkflowError> {
+    let Some(lease) = lease else {
+        return Ok(());
+    };
+    let held = engine
+        .db
+        .checkpoint_workflow_run(
+            community_id,
+            run_id,
+            lease.owner,
+            i32::try_from(next_step).unwrap_or(i32::MAX),
+            &JsonValue::Array(trace.to_vec()),
+        )
+        .await?;
+    if held {
+        Ok(())
+    } else {
+        lease.lost.store(true, std::sync::atomic::Ordering::SeqCst);
+        Err(WorkflowError::LeaseLost)
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// Execute workflow steps from `cursor`.
 ///
-/// On error, returns `(WorkflowError, PartialProgress)` so callers can persist
-/// the trace of steps completed before the failure.
-async fn execute_steps(
+/// With a `lease`, progress is checkpointed after every step and before every
+/// external side effect, so a crashed run resumes where it stopped instead of
+/// repeating completed steps. Without one (tests, previews) nothing is
+/// persisted here.
+///
+/// On error, returns `(WorkflowError, PartialProgress)` carrying the full
+/// trace so the caller can persist it with the failure.
+pub async fn execute_steps(
     engine: &WorkflowEngine,
     community_id: CommunityId,
     run_id: Uuid,
     def: &WorkflowDef,
     trigger_ctx: &TriggerContext,
-    start_index: usize,
-    initial_outputs: Option<HashMap<String, JsonValue>>,
+    cursor: RunCursor,
+    lease: Option<&LeaseHandle>,
 ) -> Result<ExecutionResult, (WorkflowError, crate::error::PartialProgress)> {
-    let mut step_outputs: HashMap<String, JsonValue> = initial_outputs.unwrap_or_default();
-    let mut trace: Vec<JsonValue> = Vec::new();
+    let RunCursor {
+        start_index,
+        outputs: mut step_outputs,
+        mut trace,
+        mut interrupted_attempt_at,
+    } = cursor;
+    let fail = |error: WorkflowError, step_index: usize, trace: Vec<JsonValue>| {
+        Err((error, crate::error::PartialProgress { step_index, trace }))
+    };
 
-    for (i, step) in def.steps.iter().enumerate() {
-        if i < start_index {
-            debug!(run_id = %run_id, step = %step.id, "Skipping already-executed step");
-            continue;
+    for (i, step) in def.steps.iter().enumerate().skip(start_index) {
+        if lease.is_some_and(|lease| lease.lost.load(std::sync::atomic::Ordering::SeqCst)) {
+            return fail(WorkflowError::LeaseLost, i, trace);
         }
 
         if let Some(expr) = &step.if_expr {
@@ -1198,31 +1243,53 @@ async fn execute_steps(
                 }
                 Ok(false) => {
                     info!(run_id = %run_id, step = %step.id, "Condition false — skipping step");
+                    interrupted_attempt_at = None;
                     trace.push(serde_json::json!({
                         "step_id": step.id,
                         "status": "skipped",
                     }));
+                    if let Err(error) =
+                        checkpoint(engine, community_id, run_id, lease, i + 1, &trace).await
+                    {
+                        return fail(error, i, trace);
+                    }
                     continue;
                 }
                 Err(e) => {
                     warn!(run_id = %run_id, step = %step.id, "Condition error: {e}");
-                    let progress = crate::error::PartialProgress {
-                        step_index: i,
-                        trace,
-                    };
-                    return Err((e, progress));
+                    return fail(e, i, trace);
                 }
             }
         }
 
         let resolved_action = match resolve_step_templates(step, trigger_ctx, &step_outputs) {
             Ok(a) => a,
-            Err(e) => {
-                let progress = crate::error::PartialProgress {
-                    step_index: i,
-                    trace,
-                };
-                return Err((e, progress));
+            Err(e) => return fail(e, i, trace),
+        };
+
+        let side_effect = matches!(
+            resolved_action,
+            ActionDef::SendMessage { .. } | ActionDef::CallWebhook { .. }
+        );
+        let attempt_at = match (side_effect, lease) {
+            (true, Some(_)) => {
+                let at = interrupted_attempt_at.take().unwrap_or_else(unix_now);
+                let mut pending = trace.clone();
+                pending.push(serde_json::json!({
+                    "step_id": step.id,
+                    "status": "dispatching",
+                    "at": at,
+                }));
+                if let Err(error) =
+                    checkpoint(engine, community_id, run_id, lease, i, &pending).await
+                {
+                    return fail(error, i, trace);
+                }
+                Some(at)
+            }
+            _ => {
+                interrupted_attempt_at = None;
+                None
             }
         };
 
@@ -1238,31 +1305,23 @@ async fn execute_steps(
                 community_id,
                 run_id,
                 trigger_ctx,
+                attempt_at,
             ),
         )
         .await;
 
         let result = match dispatch_result {
             Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                let progress = crate::error::PartialProgress {
-                    step_index: i,
-                    trace,
-                };
-                return Err((e, progress));
-            }
+            Ok(Err(e)) => return fail(e, i, trace),
             Err(_timeout) => {
-                let progress = crate::error::PartialProgress {
-                    step_index: i,
-                    trace,
-                };
-                return Err((
+                return fail(
                     WorkflowError::StepTimeout {
                         step_id: step.id.clone(),
                         timeout_secs,
                     },
-                    progress,
-                ));
+                    i,
+                    trace,
+                );
             }
         };
 
@@ -1276,15 +1335,21 @@ async fn execute_steps(
                 }));
                 step_outputs.insert(step.id.clone(), output);
             }
-            StepResult::Suspended { approval_token } => {
-                info!(
-                    run_id = %run_id, step = %step.id,
-                    "Step suspended — awaiting approval (token: <redacted>)"
-                );
-                // Return the token and current state so the caller can persist the
-                // approval record and update the run's execution trace.
+            StepResult::Suspended {
+                approver_spec,
+                message,
+                timeout_secs,
+            } => {
+                info!(run_id = %run_id, step = %step.id, "Step suspended — awaiting approval");
                 return Ok(ExecutionResult {
-                    approval_token: Some(approval_token),
+                    suspension: Some(ApprovalRequest {
+                        token: generate_approval_token(),
+                        step_id: step.id.clone(),
+                        step_index: i,
+                        approver_spec,
+                        message,
+                        timeout_secs,
+                    }),
                     step_index: i,
                     step_outputs,
                     trace,
@@ -1298,11 +1363,14 @@ async fn execute_steps(
                 }));
             }
         }
+        if let Err(error) = checkpoint(engine, community_id, run_id, lease, i + 1, &trace).await {
+            return fail(error, i + 1, trace);
+        }
     }
 
     info!(run_id = %run_id, "Workflow run completed");
     Ok(ExecutionResult {
-        approval_token: None,
+        suspension: None,
         step_index: def.steps.len(),
         step_outputs,
         trace,

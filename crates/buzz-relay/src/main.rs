@@ -1130,6 +1130,11 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
     let wf_cron = Arc::clone(&workflow_engine);
     tokio::spawn(async move { wf_cron.run().await });
 
+    // Approval expiry and crash recovery for leased runs (first pass runs
+    // immediately, so a restarted relay resumes abandoned runs promptly).
+    let wf_recovery = Arc::clone(&workflow_engine);
+    tokio::spawn(async move { wf_recovery.run_recovery().await });
+
     // Ephemeral channel reaper — archives channels whose TTL deadline has passed.
     // Runs every 60s, matching the workflow cron loop pattern. The SQL UPDATE
     // uses `archived_at IS NULL` as a guard, so concurrent runs from multiple

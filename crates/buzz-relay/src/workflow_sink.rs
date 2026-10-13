@@ -10,7 +10,7 @@ use std::sync::{Arc, Weak};
 
 use buzz_core::kind::KIND_STREAM_MESSAGE;
 use buzz_core::tenant::CommunityId;
-use buzz_workflow::action_sink::{ActionSink, ActionSinkError};
+use buzz_workflow::action_sink::{ActionSink, ActionSinkError, StepIdempotency};
 use chrono::Utc;
 use nostr::{EventBuilder, Kind, Tag};
 use tracing::info;
@@ -211,6 +211,7 @@ impl ActionSink for RelayActionSink {
         authored_text: &str,
         author_pubkey: &str,
         reply_to: Option<&str>,
+        idempotency: Option<StepIdempotency>,
     ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>> {
         let channel_id = channel_id.to_owned();
         let text = text.to_owned();
@@ -388,8 +389,19 @@ impl ActionSink for RelayActionSink {
                 &author_pubkey_hex,
             )?;
 
-            let kind = Kind::from(KIND_STREAM_MESSAGE as u16);
-            let event = EventBuilder::new(kind, &text)
+            // A step re-dispatched after executor recovery carries the same
+            // step key and first-attempt time, so it re-creates the identical
+            // event id and the insert below deduplicates it.
+            let mut builder = EventBuilder::new(Kind::from(KIND_STREAM_MESSAGE as u16), &text);
+            if let Some(idempotency) = &idempotency {
+                tags.push(
+                    Tag::parse(["buzz:workflow-step", idempotency.step_key.as_str()]).map_err(
+                        |e| ActionSinkError::EventBuild(format!("workflow step tag: {e}")),
+                    )?,
+                );
+                builder = builder.custom_created_at(nostr::Timestamp::from(idempotency.created_at));
+            }
+            let event = builder
                 .tags(tags)
                 .sign_with_keys(&state.relay_keypair)
                 .map_err(|e| ActionSinkError::EventBuild(format!("signing: {e}")))?;
@@ -471,6 +483,46 @@ impl ActionSink for RelayActionSink {
             }
 
             Ok(event_id_hex)
+        })
+    }
+
+    fn sign_event(
+        &self,
+        kind: u16,
+        content: &str,
+        tags: Vec<Tag>,
+    ) -> Result<nostr::Event, ActionSinkError> {
+        let state = self
+            .state
+            .upgrade()
+            .ok_or_else(|| ActionSinkError::Database("relay is shutting down".into()))?;
+        EventBuilder::new(Kind::Custom(kind), content)
+            .tags(tags)
+            .sign_with_keys(&state.relay_keypair)
+            .map_err(|e| ActionSinkError::EventBuild(format!("signing: {e}")))
+    }
+
+    fn publish_stored(
+        &self,
+        community_id: CommunityId,
+        event: buzz_core::StoredEvent,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let Some(state) = self.state.upgrade() else {
+                return;
+            };
+            let host = match state.db.lookup_community_host(community_id).await {
+                Ok(Some(host)) => host,
+                Ok(None) => return,
+                Err(e) => {
+                    tracing::warn!("workflow notice fan-out: community lookup failed: {e}");
+                    return;
+                }
+            };
+            let tenant = buzz_core::tenant::TenantContext::resolved(community_id, host);
+            let kind = u32::from(event.event.kind.as_u16());
+            let author = event.event.pubkey.to_hex();
+            dispatch_persistent_event(&tenant, &state, &event, kind, &author, None).await;
         })
     }
 }
@@ -878,15 +930,11 @@ mod postgres_tests {
             .expect("load stored workflow");
         let stored_definition: buzz_workflow::WorkflowDef =
             serde_json::from_value(stored_workflow.definition).expect("parse stored definition");
-        let result = buzz_workflow::executor::execute_run(
-            &state.workflow_engine,
-            community,
-            run_id,
-            &stored_definition,
-            &trigger_ctx,
-        )
-        .await
-        .expect("execute workflow");
+        let result = state
+            .workflow_engine
+            .execute_pending_run(community, run_id, &stored_definition, &trigger_ctx)
+            .await
+            .expect("execute workflow");
 
         result.step_outputs["send"]["event_id"]
             .as_str()
@@ -1092,6 +1140,7 @@ mod postgres_tests {
                 "root message",
                 &author_hex,
                 None,
+                None,
             )
             .await
             .expect("send root");
@@ -1105,6 +1154,7 @@ mod postgres_tests {
                 "threaded reply",
                 &author_hex,
                 Some(&root_hex),
+                None,
             )
             .await
             .expect("send reply");
@@ -1248,6 +1298,7 @@ mod postgres_tests {
                 "workflow reply",
                 &author_hex,
                 Some(&parent_hex),
+                None,
             )
             .await
             .expect("send reply");
@@ -1330,6 +1381,7 @@ mod postgres_tests {
                 "workflow reply to root-only parent",
                 &author_hex,
                 Some(&root_only_parent_hex),
+                None,
             )
             .await
             .expect("send root-only reply");
@@ -1393,6 +1445,7 @@ mod postgres_tests {
                 "orphan reply",
                 &author_hex,
                 Some(&unknown),
+                None,
             )
             .await
             .expect_err("reply to a non-existent parent must fail");

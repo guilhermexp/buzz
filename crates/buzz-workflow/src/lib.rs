@@ -33,11 +33,13 @@
 pub mod action_sink;
 pub mod error;
 pub mod executor;
+pub mod runner;
 pub mod schema;
 
-pub use action_sink::{ActionSink, ActionSinkError};
+pub use action_sink::{ActionSink, ActionSinkError, StepIdempotency};
 pub use error::{PartialProgress, WorkflowError};
 pub use executor::ExecutionResult;
+pub use runner::approval_reference;
 pub use schema::{ActionDef, Step, TriggerDef, WorkflowDef};
 
 use std::collections::HashMap;
@@ -46,7 +48,6 @@ use std::sync::OnceLock;
 
 use buzz_core::kind::{event_kind_u32, is_workflow_execution_kind, KIND_REACTION};
 use buzz_core::tenant::CommunityId;
-use buzz_db::workflow::RunStatus;
 use buzz_db::Db;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -102,6 +103,10 @@ pub struct WorkflowEngine {
     /// `buzz-relay`).
     pub(crate) workflow_cache:
         moka::sync::Cache<(CommunityId, Uuid), Arc<Vec<buzz_db::workflow::WorkflowRecord>>>,
+    /// This engine instance's identity as a run lease owner. Fresh per process,
+    /// so a restarted relay never mistakes a crashed predecessor's lease for
+    /// its own.
+    pub(crate) instance_id: Uuid,
 }
 
 impl WorkflowEngine {
@@ -119,6 +124,7 @@ impl WorkflowEngine {
                 .max_capacity(10_000)
                 .time_to_live(std::time::Duration::from_secs(10))
                 .build(),
+            instance_id: Uuid::new_v4(),
         }
     }
 
@@ -200,108 +206,6 @@ impl WorkflowEngine {
     /// is suitable for storage in the `definition` column.
     pub fn parse_yaml(yaml: &str) -> Result<(WorkflowDef, String), WorkflowError> {
         schema::parse_yaml(yaml)
-    }
-
-    /// Finalize a workflow run after execution completes or fails.
-    ///
-    /// This is the **single** place that maps an executor result to a DB status
-    /// update. All execution paths (event-triggered, manual trigger/webhook,
-    /// approval resume) call this instead of duplicating the 3-way match.
-    ///
-    /// `existing_trace` is prepended to the executor's trace — used by the
-    /// approval-resume path where pre-approval steps already have trace entries.
-    pub async fn finalize_run(
-        &self,
-        community_id: CommunityId,
-        run_id: uuid::Uuid,
-        result: Result<ExecutionResult, (WorkflowError, PartialProgress)>,
-        existing_trace: Option<Vec<serde_json::Value>>,
-    ) {
-        let prefix = existing_trace.unwrap_or_default();
-
-        match result {
-            Ok(result) => {
-                let mut full_trace = prefix;
-                full_trace.extend(result.trace);
-                let trace_json = serde_json::Value::Array(full_trace);
-                let step_count = result.step_index as i32;
-
-                if result.approval_token.is_some() {
-                    // Approval gates are not yet implemented (WF-08).
-                    // Fail explicitly rather than creating unreachable WaitingApproval rows.
-                    tracing::warn!(
-                        run_id = %run_id,
-                        step_index = result.step_index,
-                        "Workflow hit approval gate — not yet implemented, marking as failed"
-                    );
-                    if let Err(e) = self
-                        .db
-                        .update_workflow_run(
-                            community_id,
-                            run_id,
-                            RunStatus::Failed,
-                            step_count,
-                            &trace_json,
-                            Some(buzz_db::workflow::WorkflowRunFailure {
-                                code: "approval_not_supported",
-                                message: "approval gates not yet implemented — see WF-08",
-                            }),
-                        )
-                        .await
-                    {
-                        tracing::error!(
-                            run_id = %run_id,
-                            "Failed to update run to Failed (approval gate): {e}"
-                        );
-                    }
-                } else {
-                    tracing::info!(run_id = %run_id, "Workflow run completed");
-                    if let Err(e) = self
-                        .db
-                        .update_workflow_run(
-                            community_id,
-                            run_id,
-                            RunStatus::Completed,
-                            step_count,
-                            &trace_json,
-                            None,
-                        )
-                        .await
-                    {
-                        tracing::error!(
-                            run_id = %run_id,
-                            "Failed to update run to Completed: {e}"
-                        );
-                    }
-                }
-            }
-            Err((e, progress)) => {
-                tracing::error!(run_id = %run_id, "Workflow run failed: {e}");
-                let mut full_trace = prefix;
-                full_trace.extend(progress.trace);
-                let trace_json = serde_json::Value::Array(full_trace);
-                if let Err(db_err) = self
-                    .db
-                    .update_workflow_run(
-                        community_id,
-                        run_id,
-                        RunStatus::Failed,
-                        progress.step_index as i32,
-                        &trace_json,
-                        Some(buzz_db::workflow::WorkflowRunFailure {
-                            code: e.code(),
-                            message: &e.to_string(),
-                        }),
-                    )
-                    .await
-                {
-                    tracing::error!(
-                        run_id = %run_id,
-                        "Failed to update run to Failed: {db_err}"
-                    );
-                }
-            }
-        }
     }
 
     /// Called from the event handler post-store hook for every stored event.
@@ -425,18 +329,7 @@ impl WorkflowEngine {
                 "Workflow triggered — spawning execution"
             );
 
-            let engine = Arc::clone(self);
-            let def_clone = def.clone();
-            let ctx_clone = trigger_ctx.clone();
-
-            tokio::spawn(async move {
-                let result =
-                    executor::execute_run(&engine, community_id, run_id, &def_clone, &ctx_clone)
-                        .await;
-                engine
-                    .finalize_run(community_id, run_id, result, None)
-                    .await;
-            });
+            self.spawn_run(community_id, run_id, def.clone(), trigger_ctx.clone());
         }
 
         Ok(())
@@ -720,22 +613,7 @@ impl WorkflowEngine {
                     "Cron trigger fired"
                 );
 
-                let engine = Arc::clone(self);
-                let def_clone = def.clone();
-                let ctx_clone = trigger_ctx.clone();
-                tokio::spawn(async move {
-                    let result = executor::execute_run(
-                        &engine,
-                        community_id,
-                        run_id,
-                        &def_clone,
-                        &ctx_clone,
-                    )
-                    .await;
-                    engine
-                        .finalize_run(community_id, run_id, result, None)
-                        .await;
-                });
+                self.spawn_run(community_id, run_id, def.clone(), trigger_ctx.clone());
             }
 
             // Fix 1: prune stale last_fired entries for workflows that are no longer
