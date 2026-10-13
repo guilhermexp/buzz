@@ -156,11 +156,14 @@ fn file_mime_to_ext(mime: &str) -> Option<&'static str> {
 /// Validate uploaded bytes for the **generic file** upload path.
 ///
 /// This is the catch-all path for non-media attachments (documents, archives,
-/// text, data). It enforces three things:
+/// text, data) plus canonical PCM WAV voice notes. It enforces:
 ///   1. A size cap (`config.max_file_bytes`).
 ///   2. A *deny* list — known active-content and executable MIME types are
 ///      rejected even though safe headers already neutralise them.
-///   3. Magic-byte sniffing where possible.
+///   3. Magic-byte sniffing where possible. Recognized images and video are
+///      refused (they have their own pipelines); recognized audio is refused
+///      except WAV that passes [`crate::wav::validate_wav`], which is returned
+///      as `audio/wav` and stored byte-for-byte.
 ///
 /// Files with no detectable signature (plain text, CSV, source code, JSON —
 /// none of which have magic bytes) are accepted as `application/octet-stream`.
@@ -196,9 +199,13 @@ pub fn validate_file_content(
         Some(kind) => {
             let mime = kind.mime_type().to_string();
             // Recognized media must never fall through exact-byte attachment
-            // storage. Images and video use their canonical media validators;
-            // audio is rejected until Buzz has an explicit sanitizer and
-            // location-metadata validator for its container.
+            // storage. Images and video use their canonical media validators.
+            // Audio has a sanitizer only for canonical PCM WAV voice notes;
+            // every other audio container is rejected.
+            if mime == "audio/x-wav" || mime == "audio/wav" {
+                crate::wav::validate_wav(bytes)?;
+                return Ok(("audio/wav".to_string(), "wav".to_string()));
+            }
             if mime.starts_with("image/")
                 || mime.starts_with("video/")
                 || mime.starts_with("audio/")
@@ -1605,7 +1612,7 @@ mod tests {
         let fixtures: &[(&str, &[u8])] = &[
             ("mp3", b"ID3\x04\x00\x00\x00\x00\x00\x00"),
             ("flac", b"fLaC\x00\x00\x00\x22"),
-            ("wav", b"RIFF\x24\x00\x00\x00WAVEfmt "),
+            ("aiff", b"FORM\x00\x00\x00\x00AIFFCOMM"),
             ("ogg", b"OggS\x00\x02\x00\x00\x00\x00\x00\x00"),
             ("m4a", b"\x00\x00\x00\x18ftypM4A \x00\x00\x00\x00M4A "),
             ("aac", b"\xff\xf1\x50\x80\x00\x1f\xfc"),
@@ -1627,6 +1634,37 @@ mod tests {
                 "generic path accepted {name}"
             );
         }
+    }
+
+    #[test]
+    fn test_generic_file_path_accepts_only_canonical_wav() {
+        let config = test_config();
+        // Mono 16-bit 24 kHz PCM, 2 frames — what Buzz recorders emit.
+        let mut wav = b"RIFF\x28\x00\x00\x00WAVEfmt \x10\x00\x00\x00".to_vec();
+        wav.extend_from_slice(&[1, 0, 1, 0]); // PCM, mono
+        wav.extend_from_slice(&24_000u32.to_le_bytes());
+        wav.extend_from_slice(&48_000u32.to_le_bytes());
+        wav.extend_from_slice(&[2, 0, 16, 0]);
+        wav.extend_from_slice(b"data\x04\x00\x00\x00\x01\x00\x02\x00");
+        assert_eq!(wav.len(), 48);
+        assert_eq!(
+            validate_file_content(&wav, &config).expect("canonical voice note"),
+            ("audio/wav".to_string(), "wav".to_string())
+        );
+
+        let mut with_list = wav.clone();
+        with_list.splice(36..36, b"LIST\x04\x00\x00\x00INFO".iter().copied());
+        let riff_size = with_list.len() as u32 - 8;
+        with_list[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        assert!(matches!(
+            validate_file_content(&with_list, &config),
+            Err(MediaError::MetadataForbidden)
+        ));
+
+        assert!(matches!(
+            validate_file_content(b"RIFF\x24\x00\x00\x00WAVEfmt ", &config),
+            Err(MediaError::InvalidAudio)
+        ));
     }
 
     #[test]

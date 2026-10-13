@@ -743,6 +743,7 @@ pub enum AuthState { Pending { challenge: String }, Authenticated(AuthContext), 
 | POST | `/query` | Query Nostr events over HTTP with NIP-01 filters |
 | POST | `/count` | Count Nostr events over HTTP with NIP-45 filters |
 | POST | `/hooks/{id}` | Workflow webhook trigger (secret-authenticated) |
+| PUT | `/upload` | Upload a blob (Blossom BUD-02): images and MP4 through their media pipelines; generic files as downloads. Audio is refused except canonical 16-bit PCM WAV voice notes (`fmt ` → optional `fact` → `data`, 1–2 ch, 8–48 kHz, ≤ 5 min, no metadata chunks or trailing bytes), stored byte-for-byte as `audio/wav` with `duration` |
 | PUT | `/media/upload` | Upload media blob (Blossom, 50 MB limit) |
 | GET/HEAD | `/media/{sha256_ext}` | Retrieve/probe media blob |
 | GET | `/git/{owner}/{repo}/info/refs` | Git smart HTTP advertisement |

@@ -12,6 +12,7 @@ pub mod types;
 pub mod upload;
 pub mod upload_record;
 pub mod validation;
+pub mod wav;
 
 pub use bucket_index::{
     classify_key, fold_bucket_listing, is_tenant_owned_key, sweep_bucket_taxonomy, tenant_prefixes,

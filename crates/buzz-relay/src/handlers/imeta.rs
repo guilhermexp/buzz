@@ -162,15 +162,17 @@ pub fn validate_imeta_tags(tags: &[Vec<String>], media_base_url: &str) -> Result
             return Err("imeta tag must include url, m, x, and size".into());
         }
 
-        // Video-only NIP-71 fields must not appear on image blobs.
+        // Video-only NIP-71 fields must not appear on other blobs, except that
+        // a WAV voice note carries its `duration` (checked against the stored
+        // duration by `verify_imeta_blobs`).
         let is_video = m_value == "video/mp4";
-        if !is_video {
-            for key in &["duration", "bitrate", "image"] {
-                if seen_keys.contains(*key) {
-                    return Err(format!(
-                        "imeta {key} is only valid for video/mp4, not {m_value}"
-                    ));
-                }
+        let is_voice_note = m_value == "audio/wav";
+        for key in ["duration", "bitrate", "image"] {
+            let allowed = is_video || (is_voice_note && key == "duration");
+            if !allowed && seen_keys.contains(key) {
+                return Err(format!(
+                    "imeta {key} is only valid for video/mp4, not {m_value}"
+                ));
             }
         }
 
@@ -471,6 +473,33 @@ mod tests {
 
     const HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
     const BASE: &str = "https://relay.example.com/media";
+
+    #[test]
+    fn voice_note_imeta_may_carry_duration_only() {
+        let voice_note = |extra: &str| {
+            vec![
+                "imeta".into(),
+                format!("url /media/{HASH}.wav"),
+                "m audio/wav".into(),
+                format!("x {HASH}"),
+                "size 48044".into(),
+                "filename voice-note-1760000000000.wav".into(),
+                extra.to_string(),
+            ]
+        };
+        assert!(validate_imeta_tags(&[voice_note("duration 1.0")], BASE).is_ok());
+        assert!(validate_imeta_tags(&[voice_note("bitrate 384000")], BASE).is_err());
+
+        let other_audio = vec![
+            "imeta".into(),
+            format!("url /media/{HASH}.mp3"),
+            "m audio/mpeg".into(),
+            format!("x {HASH}"),
+            "size 100".into(),
+            "duration 1.0".into(),
+        ];
+        assert!(validate_imeta_tags(&[other_audio], BASE).is_err());
+    }
 
     #[test]
     fn link_preview_media_pair_requires_exact_local_image_url_and_hash() {

@@ -7,6 +7,7 @@
 - feat(relay): Web Push transport — the relay delivers push leases with a `webpush` endpoint itself (RFC 8291 aes128gcm payload encryption, RFC 8292 VAPID), behind an https host allow-list; NIP-11 advertises `push.webpush.application_server_key` and only configured transports (NIP-PL "Web Push" profile).
 - fix(relay): removing a member from a channel (kind 9001, self-leave 9022, admin kick) now ends their live huddle audio — sockets in the channel's linked huddle rooms get a terminal `membership_revoked` frame and close (normal `left` + 48102), derived huddle memberships are revoked and rejoin is refused.
 - fix(relay): a huddle joiner admitted through parent-derived auto-add is now republished in the huddle's NIP-29 member list (39002), so clients counting the remaining humans when someone leaves no longer end a huddle that still has participants.
+- feat(media): `PUT /upload` accepts WAV voice notes — canonical 16-bit PCM RIFF/WAVE only (1–2 channels, 8–48 kHz, ≤ 5 min); metadata chunks (LIST/INFO, id3, bext…), non-PCM, malformed sizes and trailing bytes are refused (422) rather than rewritten, so stored bytes keep the client's Blossom hash. Served as an `audio/wav` attachment with `nosniff`; the descriptor and sidecar carry `duration`, and message `imeta` may carry `duration` for `audio/wav`. All other audio stays refused (415).
 
 ## v0.5.28
 
