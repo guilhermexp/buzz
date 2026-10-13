@@ -220,7 +220,7 @@ On receipt, the application reconnects using relay/account state already stored 
 
 ## Transport Profiles
 
-Common invariant, all transports: the application payload is a transport-owned reconnect constant and MUST NOT depend on relay input, event data, or fetch success.
+Common invariant, all gateway transports: the application payload is a transport-owned reconnect constant and MUST NOT depend on relay input, event data, or fetch success. The relay-executed Web Push profile below is the only exception and is end-to-end encrypted to the browser.
 
 ### APNs
 
@@ -233,6 +233,21 @@ A future FCM profile MUST define one gateway-owned constant data message with id
 ### UnifiedPush (optional)
 
 UnifiedPush is not a conforming public-gateway profile in v1 because arbitrary distributor endpoints and message bodies do not meet the fixed-payload authority boundary. A future profile requires a separately registered constant body and hostile-endpoint analysis.
+
+### Web Push (Buzz relay-executed profile)
+
+Browsers cannot hold App Attest or gateway grants, so Buzz relays MAY execute Web Push ([RFC 8030]) directly. This profile is a deliberate, scoped exception to the fixed-constant rule in *Wake Delivery*: the application body is end-to-end encrypted to the browser with `aes128gcm` ([RFC 8291]), so the push service carries only ciphertext, and its plaintext contains routing identifiers only — never event content, sender, title or text.
+
+- **Discovery.** A relay with Web Push configured advertises `class_support.webpush: ["default"]` and `push.webpush.application_server_key`: the uncompressed P-256 VAPID public key, base64url without padding, to pass as `PushManager.subscribe({ userVisibleOnly: true, applicationServerKey })`. `app_profile` does not apply to this profile.
+- **Lease.** `transport` is `"webpush"`; `endpoint` is the JSON text of the browser subscription with exactly `{"endpoint", "keys": {"p256dh", "auth"}}` (no `expirationTime` or other members). The relay rejects the lease unless `endpoint` is an `https://` URL on its default port, without credentials or fragment, whose DNS host is on the operator allow-list (default: `updates.push.services.mozilla.com`, `fcm.googleapis.com`, `web.push.apple.com`, `*.notify.windows.com`; IP literals are never accepted), `p256dh` is an on-curve uncompressed P-256 point and `auth` is 16 octets. The relay stores the canonical JSON as the endpoint grant, so uniqueness and hashing apply to the canonical form. Gateway (`apns`) grants are opaque tokens and MUST NOT begin with `{`.
+- **Delivery.** After the normal revalidation (lease generation, expiry, membership/read authorization, community fence), the relay POSTs to the subscription endpoint with `Content-Encoding: aes128gcm`, `TTL` = seconds until the wake deadline, `Urgency` derived from the class (`default` → `normal`), and `Authorization: vapid t=<ES256 JWT>, k=<public key>` ([RFC 8292]; `aud` is the endpoint origin, `exp` ≤ 12h, `sub` is the operator contact). Redirects are not followed. The encrypted plaintext is exactly `{"v":1,"origin":<descriptor origin>,"channel":<uuid|null>,"event":<hex id>,"kind":<int|null>}`.
+- **Responses.** 2xx completes the wake; 404/410 disables that lease generation's endpoint (same path as an invalid gateway endpoint); 429/5xx/timeouts retry with the outbox's bounded backoff (honoring a numeric `Retry-After` ≤ 3600 s); other statuses fail the wake.
+- **Client.** The service worker shows a generic, locally-authored notification and opens a deep link `?community=<relay>&channel=<id>&event=<id>`; the app re-reads the event over authenticated `REQ` and navigates only if the current identity can read it in that channel. Signing out publishes `active:false` and unsubscribes the browser, so other origins' leases on that subscription are disabled by 404/410.
+- **Configuration.** `BUZZ_PUSH_VAPID_PRIVATE_KEY` (base64url raw 32-byte P-256 scalar; keep it in a 0600 secret store), `BUZZ_PUSH_VAPID_SUBJECT` (`mailto:` or `https:`), optional `BUZZ_PUSH_WEBPUSH_ALLOWED_HOSTS` (comma-separated hosts; a leading `.` allows subdomains). With Web Push configured, `BUZZ_PUSH_GATEWAY_DELIVERY_URL` becomes optional. Communities sharing a browser origin SHOULD share the VAPID key: a browser keeps one subscription per service-worker scope, and subscribing with a different key replaces it.
+
+[RFC 8030]: https://www.rfc-editor.org/rfc/rfc8030
+[RFC 8291]: https://www.rfc-editor.org/rfc/rfc8291
+[RFC 8292]: https://www.rfc-editor.org/rfc/rfc8292
 
 ## Lease and Key Lifecycle
 

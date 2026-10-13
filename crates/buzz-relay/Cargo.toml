@@ -73,6 +73,10 @@ infer = "0.19"
 serde_yaml      = { workspace = true }
 sha2            = { workspace = true }
 hmac            = { workspace = true }
+# Web Push (RFC 8291 aes128gcm + RFC 8292 VAPID); versions already in Cargo.lock.
+p256            = { version = "0.13", default-features = false, features = ["arithmetic", "ecdsa"] }
+aes-gcm         = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+hkdf            = "0.13"
 subtle          = { workspace = true }
 rand            = { workspace = true }
 hex             = { workspace = true }

@@ -4,6 +4,7 @@
 
 - feat(workflow): durable approval gates — suspension with a pending approval and relay-signed kind:46010 request, designated-approver decisions committed atomically with 46011/46012 notices, expiry, run leases with per-step checkpoints and crash recovery that resumes runs exactly once (migration 0061).
 - feat(cli): `buzz workflows approve --token` accepts the published 64-hex approval reference.
+- feat(relay): Web Push transport — the relay delivers push leases with a `webpush` endpoint itself (RFC 8291 aes128gcm payload encryption, RFC 8292 VAPID), behind an https host allow-list; NIP-11 advertises `push.webpush.application_server_key` and only configured transports (NIP-PL "Web Push" profile).
 - fix(relay): removing a member from a channel (kind 9001, self-leave 9022, admin kick) now ends their live huddle audio — sockets in the channel's linked huddle rooms get a terminal `membership_revoked` frame and close (normal `left` + 48102), derived huddle memberships are revoked and rejoin is refused.
 
 ## v0.5.28

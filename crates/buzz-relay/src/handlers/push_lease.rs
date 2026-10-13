@@ -60,7 +60,8 @@ pub struct Suppress {
 pub struct LeaseLimits<'a> {
     pub expected_origin: &'a str,
     pub author_hex: &'a str,
-    pub transport: &'a str,
+    /// Transports configured on this relay (`apns`, `webpush`).
+    pub transports: &'a [&'a str],
     pub supported_classes: &'a [&'a str],
     pub push_kinds: &'a [u64],
     pub max_subscriptions: usize,
@@ -206,7 +207,7 @@ pub fn validate_plaintext(body: &LeasePlaintext, limits: &LeaseLimits<'_>) -> Re
     let transport = body.transport.as_deref().ok_or("missing transport")?;
     let endpoint = body.endpoint.as_deref().ok_or("missing endpoint")?;
     let subscriptions = body.subscriptions.as_ref().ok_or("missing subscriptions")?;
-    if transport != limits.transport {
+    if !limits.transports.contains(&transport) {
         return Err("transport mismatch".into());
     }
     if endpoint.is_empty() || endpoint.len() > limits.max_endpoint_len {
@@ -469,10 +470,11 @@ pub async fn accept(
     let body = parse_plaintext(&plaintext, MAX_PLAINTEXT)?;
     let origin = canonical_origin(&state.config.relay_url, tenant.host())?;
     let author_hex = event.pubkey.to_hex();
+    let transports = configured_transports(&state.config);
     let limits = LeaseLimits {
         expected_origin: &origin,
         author_hex: &author_hex,
-        transport: "apns",
+        transports: &transports,
         supported_classes: &["default"],
         push_kinds: PUSH_KINDS,
         max_subscriptions: 16,
@@ -497,10 +499,13 @@ pub async fn accept(
     let subscriptions;
     let capability;
     let active = if body.active {
-        let endpoint = body
-            .endpoint
-            .as_deref()
-            .ok_or_else(|| "active lease is missing endpoint".to_string())?;
+        let endpoint = stored_endpoint(
+            body.transport.as_deref().unwrap_or_default(),
+            body.endpoint
+                .as_deref()
+                .ok_or_else(|| "active lease is missing endpoint".to_string())?,
+            state.config.push_webpush.as_ref(),
+        )?;
         let body_subscriptions = body
             .subscriptions
             .as_ref()
@@ -511,7 +516,7 @@ pub async fn accept(
             .map(|sub| sub.class.as_str())
             .max_by_key(|class| class_rank(class))
             .ok_or_else(|| "active lease has no subscriptions".to_string())?;
-        capability = endpoint.to_owned();
+        capability = endpoint;
         subscriptions = serde_json::to_value(body_subscriptions)
             .map_err(|_| "invalid subscriptions".to_string())?;
         Some(buzz_db::push::ActiveLease {
@@ -539,6 +544,37 @@ pub async fn accept(
 
 fn class_rank(_: &str) -> u8 {
     1
+}
+
+/// Transports this relay can deliver: the APNs gateway and/or Web Push.
+pub(crate) fn configured_transports(config: &crate::config::Config) -> Vec<&'static str> {
+    let mut transports = Vec::with_capacity(2);
+    if config.push_gateway_delivery_url.is_some() {
+        transports.push("apns");
+    }
+    if config.push_webpush.is_some() {
+        transports.push(crate::webpush::TRANSPORT);
+    }
+    transports
+}
+
+/// Resolve the endpoint grant persisted for a validated active lease.
+/// Web Push subscriptions are allow-list checked and stored canonically;
+/// gateway grants stay opaque but may never look like a Web Push grant.
+fn stored_endpoint(
+    transport: &str,
+    endpoint: &str,
+    webpush: Option<&crate::webpush::WebPushConfig>,
+) -> Result<String, String> {
+    if transport == crate::webpush::TRANSPORT {
+        let config = webpush.ok_or_else(|| "transport mismatch".to_string())?;
+        return crate::webpush::parse_subscription(endpoint, &config.allowed_hosts)
+            .map(|subscription| subscription.canonical);
+    }
+    if crate::webpush::is_webpush_grant(endpoint) {
+        return Err("invalid endpoint".to_string());
+    }
+    Ok(endpoint.to_owned())
 }
 
 fn canonical_origin(relay_url: &str, host: &str) -> Result<String, String> {
@@ -644,7 +680,7 @@ mod tests {
         LeaseLimits {
             expected_origin: "o",
             author_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            transport: "apns",
+            transports: &["apns"],
             supported_classes: &["default"],
             push_kinds: &[9],
             max_subscriptions: 4,
@@ -722,5 +758,37 @@ mod tests {
         );
         assert!(canonical_origin("https://relay.example", "tenant.example").is_err());
         assert!(canonical_origin("wss://relay.example", "").is_err());
+    }
+
+    #[test]
+    fn webpush_endpoints_are_allow_listed_canonical_and_never_confused_with_gateway_grants() {
+        let config = crate::webpush::WebPushConfig {
+            vapid: crate::webpush::VapidKey::from_base64url(
+                "yfWPiYE-n46HLnH0KqZOF1fJJU3MYrct3AELtAQ-oRw",
+            )
+            .unwrap(),
+            subject: "mailto:ops@example.com".to_string(),
+            allowed_hosts: vec!["updates.push.services.mozilla.com".to_string()],
+        };
+        let subscription = r#"{"keys":{"auth":"BTBZMqHH6r4Tts7J_aSIgg","p256dh":"BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4"},"endpoint":"https://updates.push.services.mozilla.com/wpush/v2/abc"}"#;
+        let stored = stored_endpoint("webpush", subscription, Some(&config)).unwrap();
+        assert!(stored.starts_with(r#"{"endpoint":"https://updates.push.services.mozilla.com/"#));
+        assert_eq!(
+            stored_endpoint("webpush", &stored, Some(&config)).unwrap(),
+            stored,
+            "canonical form is a fixed point, so endpoint_hash dedupes re-enrollment"
+        );
+        assert!(stored_endpoint("webpush", subscription, None).is_err());
+        let internal = subscription.replace(
+            "https://updates.push.services.mozilla.com/wpush/v2/abc",
+            "https://169.254.169.254/latest",
+        );
+        assert!(stored_endpoint("webpush", &internal, Some(&config)).is_err());
+        // An APNs lease cannot smuggle a Web Push grant past transport selection.
+        assert!(stored_endpoint("apns", subscription, Some(&config)).is_err());
+        assert_eq!(
+            stored_endpoint("apns", "opaque-grant", None).unwrap(),
+            "opaque-grant"
+        );
     }
 }
