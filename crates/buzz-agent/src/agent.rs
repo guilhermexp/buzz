@@ -430,6 +430,14 @@ impl RunCtx<'_> {
                     }
                 } => unreachable!(),
             };
+            // `biased` only orders the branches within a single poll. If the
+            // task is descheduled after the cancel branch reports pending, a
+            // cancel and the provider's reply can both land before the LLM
+            // branch is polled, and the LLM branch wins. A request that failed
+            // after cancel was requested must still end the turn as cancelled.
+            if response_result.is_err() && *self.cancel.borrow() {
+                return Ok(StopReason::Cancelled);
+            }
             let response = match response_result {
                 Ok(response) => response,
                 Err(AgentError::UnsupportedImageInput(detail)) => {
