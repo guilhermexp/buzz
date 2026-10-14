@@ -823,6 +823,33 @@ impl Room {
         }
     }
 
+    /// Terminate every connection `pubkey` holds in this room after its
+    /// access was revoked. Each matching peer gets `terminal_json` queued as
+    /// its final control frame; its control sender is then closed, so the
+    /// connection's forward loop drains that frame and cancels the socket.
+    /// The normal leave teardown then removes the peer, broadcasts `left` and
+    /// emits the 48102 lifecycle event. A pending (pre-commit) peer is closed
+    /// the same way as soon as its forward loop starts.
+    ///
+    /// Returns the number of connections terminated.
+    pub fn revoke_pubkey(&self, pubkey: &str, terminal_json: &str) -> usize {
+        let mut revoked = 0;
+        for mut entry in self.peers.iter_mut() {
+            if entry.pubkey != pubkey {
+                continue;
+            }
+            // Best effort: a saturated queue still closes below.
+            let _ = entry
+                .ctrl_tx
+                .try_send(PeerCtrl::Json(terminal_json.to_string()));
+            let (closed_tx, closed_rx) = mpsc::channel(1);
+            drop(closed_rx);
+            drop(std::mem::replace(&mut entry.ctrl_tx, closed_tx));
+            revoked += 1;
+        }
+        revoked
+    }
+
     /// Subscribe to ordered roster mutations. A lagged receiver must call
     /// [`Self::roster_snapshot`] and continue from that snapshot's revision.
     pub fn subscribe_roster(&self) -> broadcast::Receiver<RosterDelta> {
@@ -862,6 +889,11 @@ impl Room {
             .iter()
             .map(|e| (e.pubkey.clone(), e.peer_index))
             .collect()
+    }
+
+    /// True if any connection in the room belongs to `pubkey`.
+    pub fn has_pubkey(&self, pubkey: &str) -> bool {
+        self.peers.iter().any(|e| e.pubkey == pubkey)
     }
 
     /// True if no peers remain in the room.
@@ -926,6 +958,16 @@ impl AudioRoomManager {
         self.rooms
             .remove_if(&(community_id, channel_id), |_, room| room.is_empty())
             .is_some()
+    }
+
+    /// Channels of this community's live rooms that hold a connection for
+    /// `pubkey`.
+    pub fn channels_with_pubkey(&self, community_id: CommunityId, pubkey: &str) -> Vec<Uuid> {
+        self.rooms
+            .iter()
+            .filter(|entry| entry.key().0 == community_id && entry.value().has_pubkey(pubkey))
+            .map(|entry| entry.key().1)
+            .collect()
     }
 }
 

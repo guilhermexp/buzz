@@ -27,3 +27,5 @@ CREATE TABLE workflow_approvals (
 CREATE INDEX idx_workflow_approvals_workflow ON workflow_approvals (community_id, workflow_id);
 CREATE INDEX idx_workflow_approvals_run ON workflow_approvals (community_id, run_id);
 CREATE INDEX idx_workflow_approvals_status ON workflow_approvals (community_id, status);
+CREATE INDEX idx_workflow_approvals_pending_expiry ON workflow_approvals (expires_at)
+    WHERE status = 'pending';

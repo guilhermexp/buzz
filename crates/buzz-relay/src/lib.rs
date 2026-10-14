@@ -79,6 +79,8 @@ mod test_support;
 pub mod tunnel;
 /// Webhook secret generation and constant-time comparison.
 pub mod webhook_secret;
+/// NIP-PL `webpush` transport: browser Push API delivery (RFC 8291/8292).
+pub mod webpush;
 /// Workflow action sink — relay-side implementation of [`buzz_workflow::ActionSink`].
 pub mod workflow_sink;
 

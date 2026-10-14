@@ -372,12 +372,14 @@ pub async fn run_delivery_worker(state: Arc<AppState>) {
 }
 
 async fn delivery_worker_loop(state: &AppState) {
-    let http = match reqwest::Client::builder()
-        .timeout(state.config.push_gateway_timeout)
-        .build()
-    {
-        Ok(http) => http,
-        Err(error) => {
+    let (http, webpush_http) = match (
+        reqwest::Client::builder()
+            .timeout(state.config.push_gateway_timeout)
+            .build(),
+        crate::webpush::http_client(),
+    ) {
+        (Ok(http), Ok(webpush_http)) => (http, webpush_http),
+        (Err(error), _) | (_, Err(error)) => {
             error!(%error, "push HTTP client initialization failed");
             record_delivery("configuration_error");
             return;
@@ -389,13 +391,18 @@ async fn delivery_worker_loop(state: &AppState) {
         match state.db.active_community_hosts().await {
             Ok(communities) => {
                 for community in communities {
+                    let host = community.host;
                     let community = buzz_core::CommunityId::from_uuid(community.id);
                     let until = Utc::now() + TimeDelta::seconds(CLAIM_SECS);
                     match state.db.claim_due_push_wakes(community, 16, until).await {
                         Ok(wakes) => {
                             for wake in wakes {
                                 found = true;
-                                deliver_one(state, &http, wake).await;
+                                let clients = DeliveryClients {
+                                    gateway: &http,
+                                    webpush: &webpush_http,
+                                };
+                                deliver_one(state, clients, &host, wake).await;
                             }
                         }
                         Err(e) => warn!(%community, "push wake claim failed: {e}"),
@@ -415,11 +422,21 @@ async fn delivery_worker_loop(state: &AppState) {
     }
 }
 
+/// HTTP clients for the two transports: the configured APNs gateway and
+/// public Web Push services (no redirects, internet-scale timeout).
+#[derive(Clone, Copy)]
+struct DeliveryClients<'a> {
+    gateway: &'a reqwest::Client,
+    webpush: &'a reqwest::Client,
+}
+
 async fn deliver_one(
     state: &AppState,
-    http: &reqwest::Client,
+    clients: DeliveryClients<'_>,
+    community_host: &str,
     claimed: buzz_db::push::ClaimedWake,
 ) {
+    let http = clients.gateway;
     let outcome = match state
         .db
         .revalidate_push_wake(claimed.community, claimed.id, claimed.claim_id)
@@ -519,6 +536,20 @@ async fn deliver_one(
             return;
         }
     };
+    if crate::webpush::is_webpush_grant(&outcome.endpoint_grant) {
+        deliver_webpush(
+            state,
+            clients.webpush,
+            community_host,
+            &outcome,
+            &serving_write,
+        )
+        .await;
+        if let Err(error) = serving_write.finish().await {
+            warn!(wake=%outcome.id, %error, "failed to release community serving lease after push delivery");
+        }
+        return;
+    }
     let Some(url) = state.config.push_gateway_delivery_url.as_ref() else {
         record_delivery("configuration_error");
         return;
@@ -641,6 +672,158 @@ async fn deliver_one(
     if let Err(error) = serving_write.finish().await {
         warn!(wake=%outcome.id, %error, "failed to release community serving lease after push delivery");
     }
+}
+
+/// Deliver one revalidated wake to a browser push service (RFC 8030),
+/// mapping the response onto the shared outbox semantics: success
+/// completes, 404/410 disables the lease generation's endpoint, 429/5xx and
+/// network errors retry with bounded backoff, anything else fails.
+async fn deliver_webpush(
+    state: &AppState,
+    http: &reqwest::Client,
+    community_host: &str,
+    wake: &buzz_db::push::ClaimedWake,
+    serving_write: &buzz_deletion::ServingWriteGuard,
+) {
+    let Some(config) = state.config.push_webpush.as_ref() else {
+        record_delivery("configuration_error");
+        return;
+    };
+    let subscription =
+        match crate::webpush::parse_subscription(&wake.endpoint_grant, &config.allowed_hosts) {
+            Ok(subscription) => subscription,
+            Err(reason) => {
+                // The allow-list may have shrunk since the lease was accepted.
+                warn!(wake=%wake.id, %reason, "stored webpush endpoint no longer deliverable");
+                disable_and_fail(state, wake).await;
+                record_delivery("invalid_endpoint");
+                return;
+            }
+        };
+    let now = Utc::now().timestamp();
+    let kind = match state
+        .db
+        .get_event_by_id(wake.community, &wake.event_id)
+        .await
+    {
+        Ok(Some(stored)) => Some(stored.event.kind.as_u16()),
+        Ok(None) => {
+            // Deleted since enqueue: nothing left to notify about.
+            let _ = state
+                .db
+                .fail_push_wake(wake.community, wake.id, wake.claim_id)
+                .await;
+            record_delivery("suppressed");
+            return;
+        }
+        Err(e) => {
+            warn!(wake=%wake.id, "push event lookup failed: {e}");
+            record_delivery(retry_or_fail(state, wake, 2).await);
+            return;
+        }
+    };
+    let scheme = if state.config.relay_url.starts_with("wss://") {
+        "wss"
+    } else {
+        "ws"
+    };
+    let origin = format!("{scheme}://{community_host}");
+    let payload = crate::webpush::Payload {
+        v: 1,
+        origin: &origin,
+        channel: wake.channel_id.map(|channel| channel.to_string()),
+        event: hex::encode(&wake.event_id),
+        kind,
+    };
+    let request = serde_json::to_vec(&payload)
+        .map_err(|_| "payload encoding failed")
+        .and_then(|payload| {
+            crate::webpush::build_request(
+                http,
+                config,
+                &subscription,
+                &payload,
+                &wake.class,
+                wake.expires_at - now,
+                now,
+            )
+        });
+    let request = match request {
+        Ok(request) => request,
+        Err(error) => {
+            warn!(wake=%wake.id, %error, "webpush request construction failed");
+            record_delivery("worker_error");
+            return;
+        }
+    };
+    metrics::counter!("buzz_push_gateway_requests_total").increment(1);
+    let started = Instant::now();
+    let protected = serving_write.protect(request.send()).await;
+    metrics::histogram!("buzz_push_gateway_request_seconds")
+        .record(started.elapsed().as_secs_f64());
+    let response = match protected {
+        Ok(response) => response,
+        Err(error) => {
+            warn!(wake=%wake.id, %error, "push serving lease lost during delivery");
+            record_delivery("suppressed");
+            return;
+        }
+    };
+    let outcome = match response {
+        Ok(response) => crate::webpush::classify_response(
+            response.status(),
+            response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+        ),
+        Err(e) if e.is_timeout() || e.is_connect() => crate::webpush::DeliveryOutcome::Retry(None),
+        Err(e) => {
+            warn!(wake=%wake.id, error=%e, "webpush request failed");
+            crate::webpush::DeliveryOutcome::Retry(None)
+        }
+    };
+    match outcome {
+        crate::webpush::DeliveryOutcome::Accepted => {
+            let _ = state
+                .db
+                .complete_push_wake(wake.community, wake.id, wake.claim_id)
+                .await;
+            record_delivery("accepted");
+        }
+        crate::webpush::DeliveryOutcome::EndpointGone => {
+            warn!(wake=%wake.id, "webpush subscription expired or unsubscribed");
+            disable_and_fail(state, wake).await;
+            record_delivery("invalid_endpoint");
+        }
+        crate::webpush::DeliveryOutcome::Retry(after) => {
+            record_delivery(retry_or_fail(state, wake, after.unwrap_or(2)).await);
+        }
+        crate::webpush::DeliveryOutcome::Failed(status) => {
+            warn!(wake=%wake.id, status, "webpush delivery rejected");
+            let _ = state
+                .db
+                .fail_push_wake(wake.community, wake.id, wake.claim_id)
+                .await;
+            record_delivery("failed");
+        }
+    }
+}
+
+async fn disable_and_fail(state: &AppState, wake: &buzz_db::push::ClaimedWake) {
+    let _ = state
+        .db
+        .disable_push_endpoint(
+            wake.community,
+            &wake.author,
+            &wake.installation_id,
+            wake.lease_generation,
+        )
+        .await;
+    let _ = state
+        .db
+        .fail_push_wake(wake.community, wake.id, wake.claim_id)
+        .await;
 }
 
 fn delivery_body(

@@ -367,9 +367,13 @@ pub struct Config {
     /// Descriptor key identifier accepted in kind:30350 `exec` tags.
     pub push_executor_key_id: String,
     /// Exact HTTP(S) gateway endpoint used to sign and submit APNs delivery capabilities.
-    /// Required while push is enabled. An explicitly empty setting is allowed
-    /// only while push is disabled.
+    /// While push is enabled, at least one transport (this gateway or Web Push)
+    /// must be configured. An explicitly empty setting is allowed only while
+    /// push is disabled or Web Push is configured.
     pub push_gateway_delivery_url: Option<url::Url>,
+    /// Relay-originated Web Push (`webpush` transport): VAPID key, subject and
+    /// push-service host allow-list. `None` when `BUZZ_PUSH_VAPID_PRIVATE_KEY` is unset.
+    pub push_webpush: Option<crate::webpush::WebPushConfig>,
     /// Hard timeout for one push gateway delivery request.
     pub push_gateway_timeout: Duration,
     /// Hard timeout for one operator-listener delivery request.
@@ -1091,8 +1095,11 @@ impl Config {
                 "BUZZ_PUSH_EXECUTOR_KEY_ID must contain 1..=64 bytes".to_string(),
             ));
         }
+        let push_webpush =
+            crate::webpush::WebPushConfig::from_env().map_err(ConfigError::InvalidValue)?;
+        let gateway_required = push_enabled && push_webpush.is_none();
         let push_gateway_delivery_url = match std::env::var("BUZZ_PUSH_GATEWAY_DELIVERY_URL") {
-            Ok(raw) if raw.trim().is_empty() && push_enabled => {
+            Ok(raw) if raw.trim().is_empty() && gateway_required => {
                 return Err(ConfigError::InvalidValue(
                     "BUZZ_PUSH_GATEWAY_DELIVERY_URL must not be empty when BUZZ_PUSH_ENABLED=true"
                         .to_string(),
@@ -1100,7 +1107,7 @@ impl Config {
             }
             Ok(raw) if raw.trim().is_empty() => None,
             Ok(raw) => Some(parse_push_gateway_delivery_url(&raw)?),
-            Err(std::env::VarError::NotPresent) if push_enabled => {
+            Err(std::env::VarError::NotPresent) if gateway_required => {
                 return Err(ConfigError::InvalidValue(
                     "BUZZ_PUSH_GATEWAY_DELIVERY_URL must be configured when BUZZ_PUSH_ENABLED=true"
                         .to_string(),
@@ -1430,6 +1437,7 @@ impl Config {
             push_enabled,
             push_executor_key_id,
             push_gateway_delivery_url,
+            push_webpush,
             push_gateway_timeout,
             operator_listener_timeout,
             join_policy,
@@ -2619,6 +2627,56 @@ mod tests {
         } else {
             std::env::remove_var("BUZZ_PUSH_GATEWAY_DELIVERY_URL");
         }
+    }
+
+    #[test]
+    fn webpush_alone_satisfies_enabled_push_and_requires_a_subject() {
+        let _guards = env_guards();
+        let names = [
+            "BUZZ_PUSH_ENABLED",
+            "BUZZ_PUSH_GATEWAY_DELIVERY_URL",
+            "BUZZ_PUSH_VAPID_PRIVATE_KEY",
+            "BUZZ_PUSH_VAPID_SUBJECT",
+            "BUZZ_PUSH_WEBPUSH_ALLOWED_HOSTS",
+        ];
+        let previous: Vec<_> = names.iter().map(std::env::var_os).collect();
+        for name in names {
+            std::env::remove_var(name);
+        }
+        std::env::set_var("BUZZ_PUSH_ENABLED", "true");
+        std::env::set_var(
+            "BUZZ_PUSH_VAPID_PRIVATE_KEY",
+            "yfWPiYE-n46HLnH0KqZOF1fJJU3MYrct3AELtAQ-oRw",
+        );
+        let missing_subject = Config::from_env();
+        std::env::set_var("BUZZ_PUSH_VAPID_SUBJECT", "mailto:ops@example.com");
+        let webpush_only = Config::from_env();
+        std::env::set_var("BUZZ_PUSH_VAPID_PRIVATE_KEY", "not-a-key");
+        let bad_key = Config::from_env();
+        for (name, value) in names.iter().zip(previous) {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        assert!(matches!(
+            &missing_subject,
+            Err(ConfigError::InvalidValue(message)) if message.contains("BUZZ_PUSH_VAPID_SUBJECT")
+        ));
+        let config = webpush_only.expect("webpush-only push config");
+        assert!(config.push_gateway_delivery_url.is_none());
+        let webpush = config.push_webpush.expect("webpush configured");
+        assert_eq!(
+            webpush.vapid.public_key_base64url(),
+            "BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8"
+        );
+        assert!(webpush
+            .allowed_hosts
+            .contains(&"updates.push.services.mozilla.com".to_string()));
+        assert!(matches!(
+            &bad_key,
+            Err(ConfigError::InvalidValue(message)) if message.contains("BUZZ_PUSH_VAPID_PRIVATE_KEY")
+        ));
     }
 
     #[test]

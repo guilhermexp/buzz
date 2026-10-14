@@ -8,7 +8,14 @@
 //! - All list queries have a bounded LIMIT to prevent unbounded scans.
 
 mod deletion;
+mod execution;
 pub use deletion::WorkflowDeletionOutcome;
+pub use execution::{
+    claim_abandoned_workflow_run, claim_pending_workflow_run,
+    decide_workflow_approval_in_transaction, expire_workflow_approval, resolve_gate_trace,
+    suspend_workflow_run_for_approval, ApprovalDecision, ApprovalDecisionOutcome,
+    ApprovalSuspension, DecideApproval, DueApproval, RunLease,
+};
 
 use std::fmt;
 use std::str::FromStr;

@@ -792,3 +792,29 @@ persistent automatic addresses. Use the returned label from registration for
 insert/restore/remove. Ambiguous manually typed names must fail visibly without
 clearing the draft in chat, edit, and standalone forum consumers; never fan out
 silently to all identities sharing a name. See `docs/mention-editor.md`.
+
+## Downstream browser support
+
+This owned fork is `guilhermexp/buzz`, with `block/buzz` retained as upstream. The owner authorized
+the backend work necessary for the full browser-client mandate on 2026-10-13, including real
+workflow approval persistence/resume, voice interoperability, notifications and scoped remote
+operations. The primary behavior contract lives in the paired `guilhermexp/buzz-web` change
+`complete-web-desktop-parity`. Each repository has its own ticket, branch and verification.
+
+Keep tenant/membership/signature/privacy contracts and existing clients compatible. Do not alter
+unrelated mobile/desktop UI, use production credentials/data or expose services publicly.
+Use task-owned runtime/database/ports and generated test identities; shared default services are
+not test fixtures. Do not push upstream, force-push, merge to main or publish from the worker.
+
+## Verification
+
+For this backend work, run `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --locked --workspace`.
+These code gates do not substitute for isolated real-Relay/process/Git/audio/browser observations.
+Record behavioral RED/GREEN for fixes and keep real acceptance separate from UI fixture results.
+
+### Build
+
+```json
+{"command": {"argv": ["cargo", "build", "--locked", "--release", "-p", "buzz-relay", "-p", "buzz-cli", "-p", "buzz-admin", "-p", "buzz-acp", "-p", "buzz-agent", "-p", "buzz-dev-mcp"], "cwd": "."}}
+```

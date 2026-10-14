@@ -321,15 +321,21 @@ fn push_descriptor(
     executor_key_id: &str,
     relay_keypair: &nostr::Keys,
     tenant_host: Option<&str>,
+    transports: &[&str],
+    vapid_public_key: Option<&str>,
 ) -> Option<serde_json::Value> {
     let host = tenant_host?;
-    push_configured.then_some(())?;
+    (push_configured && !transports.is_empty()).then_some(())?;
     let scheme = if relay_url.starts_with("wss://") {
         "wss"
     } else {
         "ws"
     };
-    Some(serde_json::json!({
+    let class_support: serde_json::Map<String, serde_json::Value> = transports
+        .iter()
+        .map(|transport| ((*transport).to_string(), serde_json::json!(["default"])))
+        .collect();
+    let mut descriptor = serde_json::json!({
         "origin": format!("{scheme}://{host}"),
         "keys": [{
             "id": executor_key_id,
@@ -338,7 +344,7 @@ fn push_descriptor(
         }],
         "push_kinds": crate::handlers::push_lease::PUSH_KINDS,
         "h_grammar": "uuid-v4-lowercase",
-        "class_support": {"apns": ["default"]},
+        "class_support": class_support,
         "limitation": {
             "max_lease_ttl": 2592000,
             "max_leases_per_pubkey": 16,
@@ -353,7 +359,13 @@ fn push_descriptor(
             "max_endpoint_len": 4096,
             "max_string_len": 512
         }
-    }))
+    });
+    if let Some(key) = vapid_public_key.filter(|_| transports.contains(&crate::webpush::TRANSPORT))
+    {
+        // RFC 8292 application server key for `PushManager.subscribe`.
+        descriptor["webpush"] = serde_json::json!({ "application_server_key": key });
+    }
+    Some(descriptor)
 }
 
 /// Builds the served NIP-11 document for a request arriving on `raw_host`.
@@ -407,12 +419,19 @@ pub(crate) async fn nip11_document(state: &crate::state::AppState, raw_host: &st
     } else {
         None
     };
+    let transports = crate::handlers::push_lease::configured_transports(&state.config);
     if let Some(push) = push_descriptor(
         state.config.push_enabled,
         &state.config.relay_url,
         &state.config.push_executor_key_id,
         &state.relay_keypair,
         tenant_host.as_deref(),
+        &transports,
+        state
+            .config
+            .push_webpush
+            .as_ref()
+            .map(|webpush| webpush.vapid.public_key_base64url()),
     ) {
         info.supported_extensions
             .get_or_insert_default()
@@ -533,19 +552,71 @@ mod tests {
     use super::*;
 
     #[test]
-    fn push_descriptor_is_gated_by_gateway_configuration_and_tenant_binding() {
+    fn push_descriptor_is_gated_by_transport_configuration_and_tenant_binding() {
         let keys = nostr::Keys::generate();
-        assert!(
-            push_descriptor(false, "ws://relay", "key", &keys, Some("tenant.example")).is_none()
-        );
-        assert!(push_descriptor(true, "ws://relay", "key", &keys, None).is_none());
-        let descriptor = push_descriptor(true, "ws://relay", "key", &keys, Some("tenant.example"))
-            .expect("configured push descriptor");
+        let apns = &["apns"][..];
+        assert!(push_descriptor(
+            false,
+            "ws://relay",
+            "key",
+            &keys,
+            Some("tenant.example"),
+            apns,
+            None
+        )
+        .is_none());
+        assert!(push_descriptor(true, "ws://relay", "key", &keys, None, apns, None).is_none());
+        assert!(push_descriptor(
+            true,
+            "ws://relay",
+            "key",
+            &keys,
+            Some("tenant.example"),
+            &[],
+            None
+        )
+        .is_none());
+        let descriptor = push_descriptor(
+            true,
+            "ws://relay",
+            "key",
+            &keys,
+            Some("tenant.example"),
+            apns,
+            None,
+        )
+        .expect("configured push descriptor");
         assert_eq!(descriptor["origin"], "ws://tenant.example");
         assert_eq!(
             descriptor["push_kinds"],
             serde_json::json!(crate::handlers::push_lease::PUSH_KINDS)
         );
+        assert_eq!(
+            descriptor["class_support"],
+            serde_json::json!({"apns": ["default"]})
+        );
+        assert!(descriptor.get("webpush").is_none());
+    }
+
+    #[test]
+    fn push_descriptor_advertises_webpush_application_server_key() {
+        let keys = nostr::Keys::generate();
+        let descriptor = push_descriptor(
+            true,
+            "wss://relay",
+            "key",
+            &keys,
+            Some("tenant.example"),
+            &["webpush"],
+            Some("BPUBLIC"),
+        )
+        .expect("webpush descriptor");
+        assert_eq!(descriptor["origin"], "wss://tenant.example");
+        assert_eq!(
+            descriptor["class_support"],
+            serde_json::json!({"webpush": ["default"]})
+        );
+        assert_eq!(descriptor["webpush"]["application_server_key"], "BPUBLIC");
     }
 
     #[test]

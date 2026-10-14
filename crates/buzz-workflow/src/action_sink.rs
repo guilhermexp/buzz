@@ -64,7 +64,12 @@ pub trait ActionSink: Send + Sync {
     ///   threaded reply to that event (NIP-10 root/reply tags + real thread
     ///   metadata); when `None`, it is a top-level channel message.
     ///
+    /// - `idempotency`: when `Some`, the message must be built deterministically
+    ///   from the step key and first-attempt time so that re-dispatching the
+    ///   same step after a crash yields the same event id (and is stored once).
+    ///
     /// Returns the event ID hex string on success.
+    #[allow(clippy::too_many_arguments)]
     fn send_message(
         &self,
         community_id: CommunityId,
@@ -73,5 +78,33 @@ pub trait ActionSink: Send + Sync {
         authored_text: &str,
         author_pubkey: &str,
         reply_to: Option<&str>,
+        idempotency: Option<StepIdempotency>,
     ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>>;
+
+    /// Sign a relay-authored workflow notification event (approval request,
+    /// decision or expiry). The engine persists it atomically with the state
+    /// change it announces, then calls [`ActionSink::publish_stored`].
+    fn sign_event(
+        &self,
+        kind: u16,
+        content: &str,
+        tags: Vec<nostr::Tag>,
+    ) -> Result<nostr::Event, ActionSinkError>;
+
+    /// Fan out an event that has already been persisted in `community_id`.
+    /// Delivery is best-effort; the stored row remains queryable regardless.
+    fn publish_stored(
+        &self,
+        community_id: CommunityId,
+        event: buzz_core::StoredEvent,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+}
+
+/// Deterministic identity for a step's side effect across retries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepIdempotency {
+    /// `<run_id>:<step_id>`.
+    pub step_key: String,
+    /// First-attempt time (unix seconds), persisted before dispatch.
+    pub created_at: u64,
 }

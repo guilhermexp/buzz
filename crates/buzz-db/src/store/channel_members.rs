@@ -299,6 +299,84 @@ pub async fn insert_auto_membership_in_transaction(
     Ok(())
 }
 
+/// Revoke `pubkey`'s active memberships in the ephemeral huddle channels
+/// linked to `parent_channel_id` on a caller-owned transaction.
+///
+/// A huddle channel is linked to its parent by the creator-signed
+/// `huddle_started` event in the parent (the same authority audio admission
+/// checks). Members join those channels by derivation from the parent, so
+/// when parent membership ends the derived memberships end with it. Unlike
+/// [`remove_member`] this applies no actor-role or last-owner rule: the
+/// relay revokes derived access on the removed member's behalf, recording
+/// `removed_by`. Each revocation holds that huddle channel's membership lock,
+/// serializing with concurrent adds and audio auto-add commits.
+///
+/// Returns the huddle channels whose membership was revoked, in id order.
+pub async fn revoke_derived_huddle_memberships_in_transaction(
+    tx: &mut AdmittedTx,
+    parent_channel_id: Uuid,
+    pubkey: &[u8],
+    removed_by: &[u8],
+) -> Result<Vec<Uuid>> {
+    let community_id = tx.community();
+    let sessions: Vec<Uuid> = sqlx::query_scalar(
+        r#"
+        SELECT DISTINCT c.id
+        FROM channel_members cm
+        JOIN channels c
+          ON c.community_id = cm.community_id
+         AND c.id = cm.channel_id
+         AND c.deleted_at IS NULL
+         AND c.ttl_seconds IS NOT NULL
+        JOIN events start
+          ON start.community_id = c.community_id
+         AND start.channel_id = $3
+         AND start.kind = $4
+         AND start.pubkey = c.created_by
+         AND start.deleted_at IS NULL
+         AND octet_length(start.content) <= $5
+         AND CASE
+             WHEN start.content IS JSON OBJECT
+             THEN (start.content::json ->> 'ephemeral_channel_id')
+             ELSE NULL
+         END = c.id::text
+        WHERE cm.community_id = $1
+          AND cm.pubkey = $2
+          AND cm.removed_at IS NULL
+        ORDER BY c.id
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(pubkey)
+    .bind(parent_channel_id)
+    .bind(buzz_core::kind::KIND_HUDDLE_STARTED as i32)
+    .bind(crate::event::HUDDLE_LINK_CONTENT_MAX_BYTES)
+    .fetch_all(tx.conn())
+    .await?;
+
+    let mut revoked = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        acquire_channel_membership_lock(tx.conn(), community_id, session).await?;
+        let result = sqlx::query(
+            r#"
+            UPDATE channel_members
+            SET removed_at = NOW(), removed_by = $1
+            WHERE community_id = $2 AND channel_id = $3 AND pubkey = $4 AND removed_at IS NULL
+            "#,
+        )
+        .bind(removed_by)
+        .bind(community_id.as_uuid())
+        .bind(session)
+        .bind(pubkey)
+        .execute(tx.conn())
+        .await?;
+        if result.rows_affected() > 0 {
+            revoked.push(session);
+        }
+    }
+    Ok(revoked)
+}
+
 // ── End transaction-level helpers ─────────────────────────────────────────────
 
 /// An active member roster captured while holding the channel's membership
@@ -1633,6 +1711,29 @@ impl Db {
         actor_pubkey: &[u8],
     ) -> Result<()> {
         remove_member(&self.pool, community_id, channel_id, pubkey, actor_pubkey).await
+    }
+
+    /// Revoke `pubkey`'s memberships in the ephemeral huddle channels linked
+    /// to `parent_channel_id`, after their parent membership ended. See
+    /// [`revoke_derived_huddle_memberships_in_transaction`].
+    #[datastore_span(name = "revoke_derived_huddle_memberships", system = "postgresql")]
+    pub async fn revoke_derived_huddle_memberships(
+        &self,
+        community_id: CommunityId,
+        parent_channel_id: Uuid,
+        pubkey: &[u8],
+        removed_by: &[u8],
+    ) -> Result<Vec<Uuid>> {
+        let mut tx = self.begin_event_write_transaction(community_id).await?;
+        let revoked = revoke_derived_huddle_memberships_in_transaction(
+            &mut tx,
+            parent_channel_id,
+            pubkey,
+            removed_by,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(revoked)
     }
 
     /// Returns `true` if the pubkey is an active member.

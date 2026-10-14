@@ -801,7 +801,8 @@ pub(crate) async fn handle_active_audio_connection(
     // Derive parent_id_for_event from the membership admission result.
     // This is the channel ID that lifecycle events (48101/48102/48103) belong to.
     let parent_id_for_event = match &membership_admission {
-        MembershipAdmission::Existing { parent_channel_id } => *parent_channel_id,
+        MembershipAdmission::Existing { parent_channel_id }
+        | MembershipAdmission::HuddleMember { parent_channel_id } => *parent_channel_id,
         MembershipAdmission::AutoAddRequired {
             parent_channel_id, ..
         } => *parent_channel_id,
@@ -1506,6 +1507,26 @@ pub(crate) async fn handle_active_audio_connection(
             // Bootstrap prepared inside the permit; assigned here for ordered
             // write to `ctrl_tx` after it is created below, before task spawns.
             bootstrap_joined_msg = msg;
+            // An auto-admitted joiner is a new channel member: republish the
+            // NIP-29 member list (39002) like every other membership write, so
+            // clients counting the huddle's humans see the joiner. Spawned so
+            // discovery never delays the `joined` bootstrap.
+            if matches!(
+                membership_admission,
+                MembershipAdmission::AutoAddRequired { .. }
+            ) {
+                let state = Arc::clone(&state);
+                let tenant = tenant.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::handlers::side_effects::emit_group_discovery_events(
+                        &tenant, &state, channel_id,
+                    )
+                    .await
+                    {
+                        warn!(channel = %channel_id, error = %e, "NIP-29 group discovery emission after audio auto-add failed");
+                    }
+                });
+            }
             //
             // Fix B (remote path): now that the ingress DB transaction has
             // committed, tell the owner that this peer's slot is committed so
@@ -2548,14 +2569,20 @@ async fn heartbeat_loop(
 
 /// Outcome of [`check_membership_for_admission`].
 ///
-/// `Existing` means the caller is already a member; no write is needed at join
-/// time. `AutoAddRequired` means a membership write is still needed; it is
-/// deferred into the same DB transaction that inserts the `48101` event, so
-/// neither can commit without the other.
+/// `Existing` means the caller is already a member (or the channel is open);
+/// no write is needed at join time. `HuddleMember` is an existing membership
+/// of a private ephemeral huddle channel: it derives from parent membership
+/// and can be revoked when that ends, so the commit re-reads it under the
+/// channel membership lock. `AutoAddRequired` means a membership write is
+/// still needed; it is deferred into the same DB transaction that inserts the
+/// `48101` event, so neither can commit without the other.
 #[derive(Debug, Clone)]
 pub(crate) enum MembershipAdmission {
     /// Caller is already a member of the audio channel.
     Existing { parent_channel_id: Uuid },
+    /// Caller is a member of a private ephemeral huddle channel; the commit
+    /// re-validates that membership against concurrent revocation.
+    HuddleMember { parent_channel_id: Uuid },
     /// Caller is a member of the parent channel and needs auto-add to the
     /// audio channel. The write is deferred into `commit_participant_join`.
     AutoAddRequired {
@@ -2862,6 +2889,11 @@ async fn check_membership_for_admission(
         .map_err(AdmissionRefusal::Dependency)?;
 
     if is_member {
+        if channel.ttl_seconds.is_some() && channel.visibility != "open" {
+            return Ok(MembershipAdmission::HuddleMember {
+                parent_channel_id: lifecycle_parent_id,
+            });
+        }
         return Ok(MembershipAdmission::Existing {
             parent_channel_id: lifecycle_parent_id,
         });
@@ -2922,7 +2954,8 @@ pub(crate) enum JoinCommitError {
     Expired,
     /// Channel was archived between pre-join check and commit (IMPORTANT 4).
     Archived,
-    /// Parent membership was revoked between pre-join check and commit (IMPORTANT 4).
+    /// Parent membership — or the huddle membership derived from it — was
+    /// revoked between pre-join check and commit (IMPORTANT 4).
     ParentMembershipLost,
     /// Creator-signed huddle_started link was deleted between pre-join check
     /// and commit (IMPORTANT 4 residual: third carried fact).
@@ -3173,6 +3206,27 @@ async fn commit_participant_join(
             .await?;
         }
         // If not still_absent: concurrent add observed — membership preserved.
+    }
+
+    // 4'. HuddleMember: the huddle membership derives from the parent and is
+    //     revoked under this channel's membership lock when parent membership
+    //     ends. Re-read it under the same lock so a join admitted from a
+    //     membership revoked mid-admission cannot commit.
+    if matches!(
+        membership_admission,
+        MembershipAdmission::HuddleMember { .. }
+    ) {
+        buzz_db::channel_members::acquire_channel_membership_lock_in_transaction(
+            &mut tx, channel_id,
+        )
+        .await?;
+        if !buzz_db::channel_members::is_member_in_transaction(&mut tx, channel_id, pubkey_bytes)
+            .await?
+        {
+            retire_shadow();
+            let _ = tx.rollback().await;
+            return Err(JoinCommitError::ParentMembershipLost);
+        }
     }
 
     // 5. Insert kind `48101` uncommitted.
@@ -14053,6 +14107,241 @@ mod tests {
                     .await
                     .expect("owner link read"),
                 "an expired session must not write the owner link"
+            );
+        }
+
+        /// Removing a member from a channel ends the huddle access derived
+        /// from it: their audio connections in the channel's linked huddle get
+        /// the terminal `membership_revoked` frame and a closed control queue
+        /// (the forward loop then cancels the socket and runs the normal leave
+        /// teardown), their derived huddle membership is revoked, and neither
+        /// that membership nor auto-add from the parent can readmit them. Other
+        /// members, and the member's huddles under other parents, are untouched.
+        ///
+        /// Executed mutations: making `revoke_pubkey` a no-op fails the
+        /// `membership_revoked` frame assertion; skipping the `HuddleMember`
+        /// commit re-check lets the revoked join commit (`Ok(JoinedSent)`).
+        /// Skipping the derived-membership revocation fails the `revoked`
+        /// and huddle-membership assertions.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn parent_removal_revokes_huddle_audio_and_derived_membership() {
+            use chrono::{Duration, Utc};
+            use tokio::sync::mpsc::error::TryRecvError;
+            use uuid::Uuid;
+
+            let state = audio_test_state_real_db()
+                .await
+                .expect("PostgreSQL must be available — set BUZZ_TEST_DATABASE_URL");
+            let pool = state.db.pool().clone();
+
+            let community_uuid = Uuid::new_v4();
+            let host = format!("huddle-revoke-{}.example", community_uuid.simple());
+            sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+                .bind(community_uuid)
+                .bind(&host)
+                .execute(&pool)
+                .await
+                .expect("seed community");
+            let creator = nostr::Keys::generate().public_key().to_bytes().to_vec();
+            let target_key = nostr::Keys::generate();
+            let target = target_key.public_key().to_bytes().to_vec();
+            let target_hex = target_key.public_key().to_hex();
+            let other_key = nostr::Keys::generate();
+            let other = other_key.public_key().to_bytes().to_vec();
+            let other_hex = other_key.public_key().to_hex();
+
+            let channel = |name: &'static str, ttl: Option<i32>| {
+                let pool = pool.clone();
+                let creator = creator.clone();
+                async move {
+                    let id = Uuid::new_v4();
+                    sqlx::query(
+                        "INSERT INTO channels \
+                         (id, community_id, name, channel_type, visibility, created_by, ttl_seconds) \
+                         VALUES ($1, $2, $3, 'stream', 'private', $4, $5)",
+                    )
+                    .bind(id)
+                    .bind(community_uuid)
+                    .bind(name)
+                    .bind(&creator)
+                    .bind(ttl)
+                    .execute(&pool)
+                    .await
+                    .expect("seed channel");
+                    id
+                }
+            };
+            let member = |channel_id: Uuid, pubkey: Vec<u8>, role: &'static str| {
+                let pool = pool.clone();
+                let creator = creator.clone();
+                async move {
+                    sqlx::query(
+                        "INSERT INTO channel_members \
+                         (channel_id, community_id, pubkey, role, invited_by) \
+                         VALUES ($1, $2, $3, $4::member_role, $5)",
+                    )
+                    .bind(channel_id)
+                    .bind(community_uuid)
+                    .bind(pubkey)
+                    .bind(role)
+                    .bind(&creator)
+                    .execute(&pool)
+                    .await
+                    .expect("seed member");
+                }
+            };
+            let link = |parent: Uuid, huddle: Uuid| {
+                let pool = pool.clone();
+                let creator = creator.clone();
+                async move {
+                    sqlx::query(
+                        "INSERT INTO events \
+                         (community_id, id, pubkey, created_at, kind, tags, content, sig, channel_id) \
+                         VALUES ($1, $2, $3, NOW(), 48100, '[]', $4, $5, $6)",
+                    )
+                    .bind(community_uuid)
+                    .bind(Uuid::new_v4().as_bytes().repeat(2))
+                    .bind(&creator)
+                    .bind(serde_json::json!({ "ephemeral_channel_id": huddle }).to_string())
+                    .bind(vec![0u8; 64])
+                    .bind(parent)
+                    .execute(&pool)
+                    .await
+                    .expect("seed huddle_started link");
+                }
+            };
+
+            // Parent P with huddle H; unrelated parent Q with huddle J.
+            let parent = channel("revoke-parent", None).await;
+            let huddle = channel("revoke-huddle", Some(3600)).await;
+            let unrelated_parent = channel("revoke-unrelated", None).await;
+            let unrelated_huddle = channel("revoke-unrelated-huddle", Some(3600)).await;
+            link(parent, huddle).await;
+            link(unrelated_parent, unrelated_huddle).await;
+            for channel_id in [parent, huddle, unrelated_parent, unrelated_huddle] {
+                member(channel_id, creator.clone(), "owner").await;
+                member(channel_id, target.clone(), "member").await;
+            }
+            member(parent, other.clone(), "member").await;
+            member(huddle, other.clone(), "member").await;
+
+            let community_id = buzz_core::tenant::CommunityId::from_uuid(community_uuid);
+            let tenant = buzz_core::tenant::TenantContext::resolved(community_id, host);
+
+            // Live audio connections: target + other in H, target in J.
+            let room = state.audio_rooms.get_or_create(community_id, huddle);
+            let (_, _, _, _target_audio, mut target_ctrl, _) = room
+                .add_peer(target_hex.clone(), 3)
+                .expect("target joins H");
+            let (_, _, _, _other_audio, mut other_ctrl, _) =
+                room.add_peer(other_hex, 3).expect("other joins H");
+            let (_, _, _, _unrelated_audio, mut unrelated_ctrl, _) = state
+                .audio_rooms
+                .get_or_create(community_id, unrelated_huddle)
+                .add_peer(target_hex, 3)
+                .expect("target joins J");
+
+            // The target is admitted to H before removal (derived membership).
+            assert!(matches!(
+                check_membership_for_admission(&state, &tenant, huddle, &target, Some(parent))
+                    .await,
+                Ok(MembershipAdmission::HuddleMember { parent_channel_id }) if parent_channel_id == parent
+            ));
+
+            // Admin removes the target from P (kind 9001 side effects).
+            state
+                .db
+                .remove_member(community_id, parent, &target, &creator)
+                .await
+                .expect("remove target from parent");
+            state.invalidate_membership(&tenant, parent, &target);
+            let revoked =
+                crate::audio::revoke::revoke_huddle_access(&tenant, &state, parent, &target)
+                    .await
+                    .expect("revoke huddle access");
+            assert_eq!(
+                revoked,
+                vec![huddle],
+                "only P's huddle membership is revoked"
+            );
+
+            // The removed member's connection gets the terminal frame, then its
+            // control queue closes (the forward loop cancels the socket).
+            // Revocation is synchronous, so both are observable on return.
+            match target_ctrl.try_recv() {
+                Ok(crate::audio::room::PeerCtrl::Json(frame)) => {
+                    assert_eq!(frame, crate::audio::revoke::MEMBERSHIP_REVOKED_FRAME)
+                }
+                _ => panic!("removed member must receive the membership_revoked frame"),
+            }
+            assert!(
+                matches!(target_ctrl.try_recv(), Err(TryRecvError::Disconnected)),
+                "removed member's control queue must close"
+            );
+            assert!(matches!(other_ctrl.try_recv(), Err(TryRecvError::Empty)));
+            assert!(
+                matches!(unrelated_ctrl.try_recv(), Err(TryRecvError::Empty)),
+                "a huddle under another parent is untouched"
+            );
+
+            assert!(!state
+                .db
+                .is_member(community_id, huddle, &target)
+                .await
+                .unwrap());
+            assert!(state
+                .db
+                .is_member(community_id, huddle, &other)
+                .await
+                .unwrap());
+            assert!(state
+                .db
+                .is_member(community_id, unrelated_huddle, &target)
+                .await
+                .unwrap());
+
+            // Rejoin refused: no huddle membership and no parent auto-add.
+            assert!(matches!(
+                check_membership_for_admission(&state, &tenant, huddle, &target, Some(parent))
+                    .await,
+                Err(AdmissionRefusal::Denied("not a member"))
+            ));
+            assert!(matches!(
+                check_membership_for_admission(&state, &tenant, huddle, &other, Some(parent)).await,
+                Ok(MembershipAdmission::HuddleMember { .. })
+            ));
+
+            // A join admitted from the huddle membership before revocation
+            // cannot commit after it.
+            let gate = crate::nip_fi_gate::SessionAdmissionGate::new(
+                Utc::now() + Duration::hours(1),
+                tokio_util::sync::CancellationToken::new(),
+            );
+            let result = commit_participant_join(
+                &state,
+                &tenant,
+                huddle,
+                parent,
+                &target_key.public_key().to_hex(),
+                &target,
+                Uuid::new_v4(),
+                5,
+                0,
+                1,
+                "1",
+                &MembershipAdmission::HuddleMember {
+                    parent_channel_id: parent,
+                },
+                &gate,
+                &room,
+                None,
+                None,
+            )
+            .await;
+            assert!(
+                matches!(result, Err(JoinCommitError::ParentMembershipLost)),
+                "{result:?}"
             );
         }
     }

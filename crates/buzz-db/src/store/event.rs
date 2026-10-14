@@ -171,7 +171,7 @@ pub const D_TAG_MAX_LEN: usize = 1024;
 /// The canonical content is a small JSON object containing one UUID. Rejecting
 /// oversized candidates keeps a malformed lifecycle event from making audio
 /// admission pull large text rows into memory.
-const HUDDLE_LINK_CONTENT_MAX_BYTES: i64 = 512;
+pub(crate) const HUDDLE_LINK_CONTENT_MAX_BYTES: i64 = 512;
 /// Maximum candidate rows inspected after SQL prefiltering by parent, creator,
 /// kind, and UUID substring.
 const HUDDLE_LINK_CANDIDATE_LIMIT: i64 = 32;

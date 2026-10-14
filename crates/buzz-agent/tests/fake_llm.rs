@@ -983,7 +983,10 @@ async fn steer_rejected_on_run_id_mismatch() {
         )
         .await;
 
+    // The prompt runs in its own task and may finish before the steer request
+    // is read, so the two responses can arrive in either order.
     let mut saw_reject = false;
+    let mut saw_prompt_response = false;
     for _ in 0..40 {
         let v = h.recv().await;
         if v["id"] == json!(s_id) {
@@ -994,6 +997,9 @@ async fn steer_rejected_on_run_id_mismatch() {
             saw_reject = true;
         } else if v["id"] == json!(p_id) {
             // Turn finishes normally regardless of the rejected steer.
+            saw_prompt_response = true;
+        }
+        if saw_reject && saw_prompt_response {
             break;
         }
     }
@@ -1445,7 +1451,7 @@ async fn cancelled_turn_with_usage_emits_notification_before_response() {
             // The gate guarantees stopReason: cancelled — not a race-driven error.
             assert_eq!(
                 v["result"]["stopReason"], "cancelled",
-                "turn must end with stopReason: cancelled"
+                "turn must end with stopReason: cancelled: {v}"
             );
         }
         if saw_usage && saw_prompt_response {
@@ -1520,13 +1526,19 @@ async fn steer_rejected_on_empty_prompt() {
             json!({"sessionId": sid, "expectedRunId": run_id, "prompt": []}),
         )
         .await;
+    // The prompt runs in its own task and may finish before the steer request
+    // is read, so the two responses can arrive in either order.
     let mut saw_reject = false;
+    let mut saw_prompt_response = false;
     for _ in 0..40 {
         let v = h.recv().await;
         if v["id"] == json!(s_id) {
             assert_eq!(v["error"]["code"], -32602, "empty prompt must be rejected");
             saw_reject = true;
         } else if v["id"] == json!(p_id) {
+            saw_prompt_response = true;
+        }
+        if saw_reject && saw_prompt_response {
             break;
         }
     }

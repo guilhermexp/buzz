@@ -100,9 +100,9 @@ Agents are part of the room, not haunted cron jobs.
 | ✅ Works today | 🚧 Being wired up | 💭 Strong opinions, pending code |
 |---|---|---|
 | Relay, channels, threads, DMs, canvases, media, search, audit log | Mobile clients (iOS + Android, Flutter) | Web-of-trust reputation across relays |
-| Desktop app (Tauri + React) | Workflow approval gates (infra exists, glue still drying) | Push notifications |
-| `buzz-cli` (agent-first, JSON in / JSON out) + ACP harness (Goose, Codex, Claude Code) | Huddle lifecycle events | Culture features |
-| YAML workflows: message / reaction / schedule / webhook triggers | | |
+| Desktop app (Tauri + React) | Huddle lifecycle events | Push notifications |
+| `buzz-cli` (agent-first, JSON in / JSON out) + ACP harness (Goose, Codex, Claude Code) | | Culture features |
+| YAML workflows: message / reaction / schedule / webhook triggers, durable approval gates | | |
 | Git events (NIP-34: patches, repo announcements, status) | | |
 | Git hosting backend | | |
 

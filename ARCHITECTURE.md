@@ -645,9 +645,11 @@ Note: Both `TriggerDef` and `ActionDef` use serde internally-tagged enums. Trigg
 
 **Condition evaluation:** `evalexpr` with `HashMapContext`. Dot notation converted to underscores (`trigger.text` → `trigger_text`). Custom functions registered: `str_contains`, `str_starts_with`, `str_ends_with`, `str_len`. 100ms timeout prevents adversarial expressions from blocking.
 
-**Concurrency:** `Arc<Semaphore>` with 100 permits. `try_acquire()` — returns `CapacityExceeded` immediately rather than queuing.
+**Concurrency:** `Arc<Semaphore>` with 100 permits. Fresh runs use `try_acquire()` and fail with `CapacityExceeded` rather than queuing; resumed and recovered runs wait for a permit.
 
-**Approval gates:** `request_approval` action returns `StepResult::Suspended` with a generated UUID token, but the engine does not yet persist the token or resume execution — runs that hit an approval gate are marked as failed (🚧 WF-08). `execute_from_step()` exists for future resumption support.
+**Run leases and recovery:** a run in `running` is owned by one engine instance through a renewable lease (`workflow_runs.lease_owner`/`lease_expires_at`, 15 s TTL renewed every 5 s). Progress is checkpointed after every step and before every external side effect (`execution_trace` + `current_step`). A recovery loop (every 2 s, plus once at startup) reclaims runs whose lease lapsed and resumes them from the checkpoint. A `send_message` step interrupted mid-dispatch is re-sent with its persisted first-attempt timestamp and a `buzz:workflow-step` tag, so the relay-signed event has the same id and is stored once; webhooks carry an `Idempotency-Key: <run_id>:<step_id>` header (at-least-once). Settlement is compare-and-set on the lease, so a stale executor never overwrites its successor.
+
+**Approval gates:** `request_approval` (`from`: hex pubkey, npub or `any`; `timeout` 1 s–30 d, default 24 h) suspends the run in one transaction: run → `waiting_approval` (lease released), a `workflow_approvals` row (token stored as SHA-256), and a relay-signed kind:46010 request in the workflow channel (`h`, `d` = token hash, `p` = approver, JSON content with summary, run/workflow/step ids and `expires_at`). A kind:46030/46031 decision is accepted only from the designated approver (or any member for `any`) who is a current member of the channel; the client command, approval status, run transition and a relay-signed 46011/46012 notice commit together. A grant moves the run to `running` under the deciding relay's lease and resumes at the next step; a denial cancels it (`approval_denied`). Overdue approvals are expired by the recovery loop (approval `expired`, run `failed`/`approval_expired`, 46012 with `status=expired`). Replayed or late decisions are rejected and never re-run steps.
 
 **Cron scheduler:** loop ticks every 60 seconds, evaluates cron expressions with window-based matching, and creates workflow runs for matched triggers. Fully implemented.
 
@@ -673,6 +675,8 @@ Real-time voice lives inside `buzz-relay` (`src/audio/`), not a separate crate. 
 **Room state:** an admission guard synchronizes joins against the room's ended flag; soft cap 25 peers (hard cap 255 via `u8` peer index). Per-peer audio uses a bounded channel (drop-on-full); the control channel is separate and never drops join/leave.
 
 **Lifecycle events:** the relay emits Nostr events for participant joined / left and huddle ended; the desktop client emits huddle started and guidelines. When the last peer leaves, the room ends and the channel archives atomically.
+
+**Revocation:** huddle access derives from channel membership. When a member is removed from a channel, leaves it, or is kicked, the relay revokes their memberships in the ephemeral huddle channels linked to it (creator-signed huddle started), sends their audio sockets in those rooms (and the channel's own room) a final `{"type":"error","code":"membership_revoked",…}` frame and closes them; the normal leave path then broadcasts `left` and emits the participant-left event. A rejoin is refused (`not a member`): neither the revoked huddle membership nor auto-add from the parent admits it, and a join admitted from a membership revoked mid-admission fails its commit re-check. Socket termination is pod-local; the durable membership writes refuse the member on every pod. A community ban closes every socket of the member, audio included.
 
 **Not yet built:** recording and per-track publishing (the corresponding kinds are reserved, no producer exists).
 
@@ -739,6 +743,7 @@ pub enum AuthState { Pending { challenge: String }, Authenticated(AuthContext), 
 | POST | `/query` | Query Nostr events over HTTP with NIP-01 filters |
 | POST | `/count` | Count Nostr events over HTTP with NIP-45 filters |
 | POST | `/hooks/{id}` | Workflow webhook trigger (secret-authenticated) |
+| PUT | `/upload` | Upload a blob (Blossom BUD-02): images and MP4 through their media pipelines; generic files as downloads. Audio is refused except canonical 16-bit PCM WAV voice notes (`fmt ` → optional `fact` → `data`, 1–2 ch, 8–48 kHz, ≤ 5 min, no metadata chunks or trailing bytes), stored byte-for-byte as `audio/wav` with `duration` |
 | PUT | `/media/upload` | Upload media blob (Blossom, 50 MB limit) |
 | GET/HEAD | `/media/{sha256_ext}` | Retrieve/probe media blob |
 | GET | `/git/{owner}/{repo}/info/refs` | Git smart HTTP advertisement |
@@ -952,5 +957,5 @@ These are verified gaps in the current implementation — not design aspirations
 | 2 | **No rate limiting implementation** | `RateLimiter` trait exists in `buzz-auth`. Only implementation is `AlwaysAllowRateLimiter` (test stub, gated behind `#[cfg(any(test, feature = "test-utils"))]`). `RateLimitConfig` defines 4 tiers (human, agent-standard, agent-elevated, agent-platform) but none are enforced. |
 | 3 | **No dedicated typing REST endpoint** | Typing indicators (kind 20002) are delivered via both local fan-out and Redis pub/sub (cross-node). There is no REST endpoint to query current typers — `/api/presence` returns online/away status only, not typing state. |
 | 4 | **Huddle recording/tracks not built** | Voice, room lifecycle, and join/leave/end events are wired (see Huddle Audio above). Recording and per-track publishing have reserved kinds but no producer yet. |
-| 5 | **Approval gates not wired end-to-end** | The executor returns `StepResult::Suspended` and the relay has grant/deny API endpoints with DB CRUD, but the engine intercepts before creating `WaitingApproval` rows — runs that hit an approval gate are marked as Failed (🚧 WF-08). |
+| 5 | **Workflow webhook steps are at-least-once** | A `call_webhook` step interrupted by a crash is re-delivered on recovery with the same `Idempotency-Key`; receivers must deduplicate. Message steps are deduplicated by event id. |
 | 6 | **Workflow actions partially stubbed** | The `send_dm` and `set_channel_topic` workflow actions are in the schema but return `NotImplemented` — a run that reaches one fails at execution (🚧 WF-07). |

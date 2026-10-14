@@ -63,6 +63,11 @@ pub enum WorkflowError {
     /// The action is defined but not yet implemented.
     #[error("action not implemented: {0}")]
     NotImplemented(String),
+
+    /// This executor no longer holds the run's lease; another executor (or a
+    /// terminal decision) owns its state, so this one must stop silently.
+    #[error("run lease lost")]
+    LeaseLost,
 }
 
 impl WorkflowError {
@@ -79,6 +84,7 @@ impl WorkflowError {
             Self::Database(_) => "database_error",
             Self::Unauthorized(_) => "owner_unauthorized",
             Self::NotImplemented(_) => "action_not_implemented",
+            Self::LeaseLost => "lease_lost",
         }
     }
 }
